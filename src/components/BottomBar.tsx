@@ -55,6 +55,19 @@ export function BottomBar() {
     return () => window.removeEventListener('lyria-active-version', handleActiveVersion);
   }, [isPlaying]);
 
+  // Auto-play requests from CenterPanel (cinematic reveal: a fresh generation starts
+  // playing the moment it lands). Dispatched immediately after the 'lyria-active-version'
+  // event, whose handler above swaps the player source synchronously — so play() always
+  // lands on the new track.
+  useEffect(() => {
+    const handleTransportPlay = () => {
+      void player.play();
+      setIsPlaying(true);
+    };
+    window.addEventListener('lyria-transport-play', handleTransportPlay);
+    return () => window.removeEventListener('lyria-transport-play', handleTransportPlay);
+  }, []);
+
   // Real meters: while playing, read the player's analyser-derived levels each
   // frame and drive the bar visuals. Rest at zero (dim) when not playing.
   // Also drives the orb visualizer iframe: every other frame (~30fps) we grab

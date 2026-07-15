@@ -75,6 +75,11 @@ export const Waveform = memo(({
   } | null>(null);
 
   const hasRealPeaks = !!peaks && peaks.length > 0;
+  // Materialize reveal progress (0..1): 1 = fully drawn (steady state). Reset to 0 and
+  // animated back to 1 by the effect below whenever a NEW peaks array lands, so fresh
+  // audio sweeps in left-to-right instead of just appearing. A ref (not state) because
+  // it changes per animation frame and only the canvas cares.
+  const revealRef = useRef(1);
   // Seeking only makes sense once there's real audio-bearing peak data AND the player
   // actually has a source loaded — otherwise there is nothing to scrub to.
   const isSeekable = (seekable ?? true) && hasRealPeaks && player.hasSource;
@@ -208,9 +213,29 @@ export const Waveform = memo(({
     }
 
     // Blit the cached bars at device-pixel scale (the layer is already DPR-sized),
-    // then switch to CSS-pixel scale for the playhead overlay.
-    ctx.drawImage(layer.canvas, 0, 0);
+    // then switch to CSS-pixel scale for the playhead overlay. While the materialize
+    // reveal is running (revealRef < 1, driven by the effect below), only the left
+    // `reveal` fraction of the bars layer is blitted — the waveform sweeps into
+    // existence with a bright leading edge, the visual payoff of a fresh generation.
+    const reveal = Math.max(0, Math.min(1, revealRef.current));
+    if (reveal < 1) {
+      const revealPx = Math.max(1, Math.round(layer.pixelWidth * reveal));
+      ctx.drawImage(layer.canvas, 0, 0, revealPx, layer.pixelHeight, 0, 0, revealPx, layer.pixelHeight);
+    } else {
+      ctx.drawImage(layer.canvas, 0, 0);
+    }
     ctx.scale(dpr, dpr);
+
+    if (reveal < 1) {
+      const edgeX = reveal * width;
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.shadowColor = 'rgba(232, 201, 158, 0.9)';
+      ctx.shadowBlur = 12;
+      ctx.fillStyle = 'rgba(255, 252, 240, 0.9)';
+      ctx.fillRect(edgeX - 0.5, height * 0.15, 1, height * 0.7);
+      ctx.restore();
+    }
 
     // Playhead: 1px bright line with a soft glow, positioned from the player's own
     // transport when seekable, else falls back to the `progress` prop.
@@ -246,6 +271,39 @@ export const Waveform = memo(({
   useEffect(() => {
     draw();
   }, [draw, cssWidth]);
+
+  // Materialize animation driver: a new peaks array (fresh generation / tab switch)
+  // sweeps the bars in over ~0.9s with easeOutCubic. Under prefers-reduced-motion the
+  // reveal is skipped entirely — bars appear instantly, exactly the previous behavior.
+  const revealRafRef = useRef<number | null>(null);
+  const lastRevealPeaksRef = useRef<number[] | null | undefined>(undefined);
+  useEffect(() => {
+    if (peaks === lastRevealPeaksRef.current) return; // same array — nothing new landed
+    lastRevealPeaksRef.current = peaks;
+    if (revealRafRef.current != null) {
+      cancelAnimationFrame(revealRafRef.current);
+      revealRafRef.current = null;
+    }
+    if (!hasRealPeaks || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      revealRef.current = 1;
+      draw();
+      return;
+    }
+    const REVEAL_MS = 900;
+    const startTime = performance.now();
+    revealRef.current = 0;
+    const step = (now: number) => {
+      const t = Math.min(1, (now - startTime) / REVEAL_MS);
+      revealRef.current = 1 - Math.pow(1 - t, 3); // easeOutCubic
+      draw();
+      revealRafRef.current = t < 1 ? requestAnimationFrame(step) : null;
+    };
+    revealRafRef.current = requestAnimationFrame(step);
+  }, [peaks, hasRealPeaks, draw]);
+
+  useEffect(() => () => {
+    if (revealRafRef.current != null) cancelAnimationFrame(revealRafRef.current);
+  }, []);
 
   // rAF playhead loop — runs only while the player is actually playing, and
   // self-terminates the instant it stops (pause/end/no source) rather than polling

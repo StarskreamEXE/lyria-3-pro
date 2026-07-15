@@ -8,8 +8,8 @@ import { SidebarLeft } from './SidebarLeft';
 import { SidebarRight, modelIdToLabel } from './SidebarRight';
 import { ExportPanel } from './ExportPanel';
 import { ContextMenuHost, showContextMenu } from './ContextMenu';
-import throttle from 'lodash/throttle';
 import { extractPeaks } from '../lib/waveformData';
+import { buildTimelineSections, sectionIndexAt, formatSeconds } from '../lib/sections';
 import { analyzeGeneration, listGenerations, renameGeneration, type Analysis, type GenerationEntry, type Project } from '../lib/lyriaClient';
 import { projectStore } from '../lib/projectStore';
 import { player } from '../lib/player';
@@ -44,6 +44,9 @@ export interface Version {
   // Pinned contract: optional user-supplied or renamed track title (server agent,
   // lands at next server restart) — used for the tab tooltip and rename dialogs.
   title?: string;
+  // Real measured track duration from the manifest (wav parsed, clip constant) —
+  // the denominator for the detected-structure timeline's section widths.
+  durationSeconds?: number;
   // Absent/empty today — the server only returns a single mixed master. theDAW
   // backend will eventually populate this once it can separate real stems.
   stems?: { name: string; audioUrl: string }[];
@@ -67,6 +70,7 @@ function materializeVersion(payload: Partial<GenerationEntry> & { id?: string },
     structure: payload.structure,
     analysis: payload.analysis,
     title: payload.title,
+    durationSeconds: payload.durationSeconds,
   };
 }
 
@@ -79,92 +83,9 @@ export function CenterPanel() {
   const versionsRef = useRef<Version[]>(versions);
   const [modelName, setModelName] = useState('LYRIA 3 PRO');
   const [durationTarget, setDurationTarget] = useState('3:00');
-  const [lockedSections, setLockedSections] = useState<Record<number, boolean>>({});
-  const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [selectedSection, setSelectedSection] = useState({ id: 4, name: 'CHORUS', time: '2:24', timeRange: '2:24 - 2:46 (22s)' });
+  const [lockedSections, setLockedSections] = useState<Record<string, boolean>>({});
+  const [selectedSectionIdx, setSelectedSectionIdx] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1);
-
-  const [sections, setSections] = useState([
-    { id: 1, name: 'INTRO', time: '0:00', timeRange: '0:00 - 0:16 (16s)', width: 10, bg: '' },
-    { id: 2, name: 'VERSE 1', time: '0:16', timeRange: '0:16 - 0:48 (32s)', width: 15, bg: 'bg-black/10' },
-    { id: 3, name: 'PRE', time: '0:48', timeRange: '0:48 - 1:04 (16s)', width: 10, bg: '' },
-    { id: 4, name: 'CHORUS', time: '1:04', timeRange: '1:04 - 1:36 (32s)', width: 18, bg: 'bg-black/10' },
-    { id: 5, name: 'VERSE 2', time: '1:36', timeRange: '1:36 - 2:08 (32s)', width: 15, bg: 'bg-black/10' },
-    { id: 6, name: 'PRE', time: '2:08', timeRange: '2:08 - 2:24 (16s)', width: 10, bg: '' },
-    { id: 7, name: 'CHORUS 2', time: '2:24', timeRange: '2:24 - 2:46 (22s)', width: 18, bg: '' },
-    { id: 8, name: 'OUT', time: '2:46', timeRange: '2:46 - 2:54 (8s)', width: 4, bg: '' }
-  ]);
-
-  const draggingRef = useRef<{ id: number; edge: 'left' | 'right'; startX: number; startWidth: number; siblingStartWidth: number } | null>(null);
-
-  const handleDragStart = (e: React.MouseEvent, id: number, edge: 'left' | 'right') => {
-    e.stopPropagation();
-    e.preventDefault();
-    const index = sections.findIndex(s => s.id === id);
-    if (edge === 'left' && index === 0) return; 
-    if (edge === 'right' && index === sections.length - 1) return; 
-
-    const siblingIndex = edge === 'left' ? index - 1 : index + 1;
-    
-    draggingRef.current = {
-      id,
-      edge,
-      startX: e.clientX,
-      startWidth: sections[index].width,
-      siblingStartWidth: sections[siblingIndex].width,
-    };
-  };
-
-  const handleMouseMove = useMemo(() => throttle((e: MouseEvent) => {
-    if (!draggingRef.current) return;
-    const { id, edge, startX, startWidth, siblingStartWidth } = draggingRef.current;
-    const deltaX = e.clientX - startX;
-    
-    const totalWidthPx = 1000 * zoom; 
-    const deltaPct = (deltaX / totalWidthPx) * 100;
-    
-    setSections(prev => {
-      const index = prev.findIndex(s => s.id === id);
-      if (index === -1) return prev;
-      
-      const newSections = [...prev];
-      const siblingIndex = edge === 'left' ? index - 1 : index + 1;
-      
-      let newWidth = startWidth + (edge === 'right' ? deltaPct : -deltaPct);
-      let newSiblingWidth = siblingStartWidth + (edge === 'right' ? -deltaPct : deltaPct);
-      
-      if (newWidth < 2) {
-        const diff = 2 - newWidth;
-        newWidth = 2;
-        newSiblingWidth -= diff;
-      } else if (newSiblingWidth < 2) {
-        const diff = 2 - newSiblingWidth;
-        newSiblingWidth = 2;
-        newWidth -= diff;
-      }
-      
-      newSections[index] = { ...newSections[index], width: newWidth };
-      newSections[siblingIndex] = { ...newSections[siblingIndex], width: newSiblingWidth };
-      
-      return newSections;
-    });
-  }, 16), [zoom]);
-
-  useEffect(() => {
-    const handleMouseUp = () => {
-      draggingRef.current = null;
-    };
-    
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-      // A trailing throttled invocation could otherwise fire after unlisten/unmount
-      // (lodash throttle keeps its own timer) — cancel it with the listener.
-      handleMouseMove.cancel();
-    };
-  }, [handleMouseMove]);
 
 
   // New versions arrive from GENERATE (SidebarLeft) via the app event bus. SidebarLeft
@@ -175,6 +96,13 @@ export function CenterPanel() {
   // generation supersedes it (so the new tab's pulse isn't cut short by the old timer)
   // and on unmount (no setState after unmount).
   const freshVersionsTimeoutRef = useRef<number | null>(null);
+  // Auto-play arming: set on 'lyria-action-start' (a generate is underway), consumed by
+  // the FIRST 'lyria-generated' arrival of the batch, disarmed on 'lyria-action-end' so
+  // a failed generation can never leave a stale arm behind. The actual play request is
+  // dispatched from the active-version broadcast effect below, AFTER BottomBar has
+  // swapped the player source to the new version.
+  const autoPlayArmedRef = useRef(false);
+  const autoPlayVersionNRef = useRef<number | null>(null);
   useEffect(() => {
     const handleGenerated = (e: Event) => {
       const { payload } = (e as CustomEvent).detail ?? {};
@@ -186,6 +114,14 @@ export function CenterPanel() {
       setVersions(next);
       setActiveVersion(added.n);
       setFreshVersions([added.n]);
+      // Cinematic reveal: the first arrival of the batch auto-plays…
+      if (autoPlayArmedRef.current && added.audioUrl) {
+        autoPlayArmedRef.current = false;
+        autoPlayVersionNRef.current = added.n;
+      }
+      // …and every arrival auto-analyzes (server-cached; deterministic mock in $0 dev
+      // mode) so GENRE/MOOD/BPM/KEY and the detected structure cascade in unprompted.
+      if (added.id) void handleAnalyze(added.id);
       if (freshVersionsTimeoutRef.current != null) window.clearTimeout(freshVersionsTimeoutRef.current);
       freshVersionsTimeoutRef.current = window.setTimeout(() => {
         freshVersionsTimeoutRef.current = null;
@@ -343,6 +279,13 @@ export function CenterPanel() {
     window.dispatchEvent(new CustomEvent('lyria-active-version', {
       detail: { n: activeVersion, audioUrl: v?.audioUrl ?? null, format: v?.format ?? null },
     }));
+    // Auto-play the just-generated version — dispatched AFTER the active-version event
+    // above, whose BottomBar handler synchronously swaps the player source, so the play
+    // request always lands on the fresh track.
+    if (autoPlayVersionNRef.current === activeVersion && v?.audioUrl) {
+      autoPlayVersionNRef.current = null;
+      window.dispatchEvent(new CustomEvent('lyria-transport-play'));
+    }
   }, [activeVersion, versions]);
 
   // Real waveform peaks for the active version's master mix (the single mixed-down
@@ -380,6 +323,37 @@ export function CenterPanel() {
   // block another stem's lane from rendering.
   const activeVersionData = versions.find(x => x.n === activeVersion);
   const activeStems = activeVersionData?.stems ?? [];
+
+  // Detected-structure timeline: derived ONLY from the active version's real audio
+  // analysis (sections + measured duration). No analysis → no structure rendered.
+  const timelineSections = useMemo(
+    () => buildTimelineSections(activeVersionData?.analysis?.sections, activeVersionData?.durationSeconds),
+    [activeVersionData?.analysis?.sections, activeVersionData?.durationSeconds],
+  );
+  const selectedSection = selectedSectionIdx !== null ? timelineSections[selectedSectionIdx] : undefined;
+  // Section lock state is per version + section index (sections are real per-track data now).
+  const lockKeyFor = (idx: number) => `${activeVersionData?.id ?? 'none'}:${idx}`;
+
+  // Selection belongs to one version's detected sections — switching versions resets it.
+  useEffect(() => {
+    setSelectedSectionIdx(null);
+  }, [activeVersion]);
+
+  // Live playback highlight: which detected section the playhead is currently inside.
+  // Cheap 250ms poll (matches BottomBar's readout cadence), only while sections exist.
+  const [playingSectionIdx, setPlayingSectionIdx] = useState<number | null>(null);
+  useEffect(() => {
+    if (timelineSections.length === 0) {
+      setPlayingSectionIdx(null);
+      return;
+    }
+    const tick = () => {
+      setPlayingSectionIdx(player.isPlaying ? sectionIndexAt(timelineSections, player.currentTime) : null);
+    };
+    tick();
+    const interval = window.setInterval(tick, 250);
+    return () => window.clearInterval(interval);
+  }, [timelineSections]);
   const [stemPeaks, setStemPeaks] = useState<Record<string, number[] | null>>({});
   const stemRequestRef = useRef<Record<string, number>>({});
 
@@ -560,26 +534,33 @@ export function CenterPanel() {
     ]);
   };
 
-  // Single-turn API: section edits are prompt directives + a fresh generation
+  // Single-turn API: section edits are prompt directives + a fresh generation. The
+  // range in every directive comes from the REAL detected section of the active
+  // version's audio (buildTimelineSections above) — never from an invented layout.
   const handleSectionAction = (action: 'regenerate' | 'extend' | 'restyle' | 'replace') => {
-    const range = selectedSection.timeRange.split(' (')[0];
+    const sec = selectedSection;
+    if (!sec) return;
+    const range = `${formatSeconds(sec.startSeconds)} - ${formatSeconds(sec.endSeconds)}`;
+    const name = sec.name || 'section';
     const directives: Record<string, string> = {
-      regenerate: `[${range}] ${selectedSection.name}: generate a new variation of this section`,
-      extend: `[${range}] ${selectedSection.name}: extend this section into a longer arrangement`,
-      restyle: `[${range}] ${selectedSection.name}: restyle with new texture and instrumentation`,
-      replace: `[${range}] ${selectedSection.name}: replace with a contrasting section`,
+      regenerate: `[${range}] ${name}: generate a new variation of this section`,
+      extend: `[${range}] ${name}: extend this section into a longer arrangement`,
+      restyle: `[${range}] ${name}: restyle with new texture and instrumentation`,
+      replace: `[${range}] ${name}: replace with a contrasting section`,
     };
     window.dispatchEvent(new CustomEvent('lyria-prompt-append', { detail: { text: directives[action] } }));
     generateNewVersion();
   };
 
   const toggleLockSection = () => {
-    const id = selectedSection.id;
-    const next = !lockedSections[id];
-    setLockedSections(prev => ({ ...prev, [id]: next }));
+    const sec = selectedSection;
+    if (sec === undefined || selectedSectionIdx === null) return;
+    const key = lockKeyFor(selectedSectionIdx);
+    const next = !lockedSections[key];
+    setLockedSections(prev => ({ ...prev, [key]: next }));
     if (next) {
-      const range = selectedSection.timeRange.split(' (')[0];
-      window.dispatchEvent(new CustomEvent('lyria-prompt-append', { detail: { text: `[${range}] ${selectedSection.name}: locked — keep exactly as is` } }));
+      const range = `${formatSeconds(sec.startSeconds)} - ${formatSeconds(sec.endSeconds)}`;
+      window.dispatchEvent(new CustomEvent('lyria-prompt-append', { detail: { text: `[${range}] ${sec.name || 'section'}: locked — keep exactly as is` } }));
     }
   };
 
@@ -591,11 +572,17 @@ export function CenterPanel() {
 
   useEffect(() => {
     const handleStart = () => {
+      // Cinematic generation state: arm auto-play for the batch's first arrival and
+      // stamp <html> so CSS can dim the room around the orb (.lyria-dim-on-generate).
+      autoPlayArmedRef.current = true;
+      document.documentElement.classList.add('lyria-generating');
       if (iframeRef.current?.contentWindow) {
         iframeRef.current.contentWindow.postMessage({ type: 'ACTION_START' }, '*');
       }
     };
     const handleEnd = () => {
+      autoPlayArmedRef.current = false;
+      document.documentElement.classList.remove('lyria-generating');
       if (iframeRef.current?.contentWindow) {
         iframeRef.current.contentWindow.postMessage({ type: 'ACTION_END' }, '*');
       }
@@ -607,6 +594,7 @@ export function CenterPanel() {
     return () => {
       window.removeEventListener('lyria-action-start', handleStart);
       window.removeEventListener('lyria-action-end', handleEnd);
+      document.documentElement.classList.remove('lyria-generating');
     };
   }, []);
 
@@ -665,18 +653,20 @@ export function CenterPanel() {
             no analysis yet show a single ANALYZE button; once analysis exists, real values
             only — bpm/key render nothing when null rather than inventing a number. */}
         {activeVersionData?.audioUrl && (
-          <div className="absolute left-0 top-0 bottom-0 w-48 p-6 flex flex-col justify-center gap-4 z-10 overflow-y-auto">
+          <div key={`${activeVersionData.id ?? 'none'}-${activeVersionData.analysis ? 'analyzed' : 'raw'}`} className="absolute left-0 top-0 bottom-0 w-48 p-6 flex flex-col justify-center gap-4 z-10 overflow-y-auto lyria-dim-on-generate">
             {activeVersionData.analysis ? (
               <>
-                <div>
+                {/* Badges cascade in one-by-one when the analysis lands (keyed remount above) —
+                    the app audibly "listening to its own output" moment. */}
+                <div className="lyria-cascade-in" style={{ '--cascade-i': 0 } as React.CSSProperties}>
                   <span title="Detected genre from the real audio analysis" className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">GENRE</span>
                   <span className="text-xs text-lyria-text-main font-medium leading-snug block opacity-90">{activeVersionData.analysis.genre}</span>
                 </div>
-                <div>
+                <div className="lyria-cascade-in" style={{ '--cascade-i': 1 } as React.CSSProperties}>
                   <span title="Detected mood from the real audio analysis" className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">MOOD</span>
                   <span className="text-xs text-lyria-text-main font-medium leading-snug block opacity-90">{activeVersionData.analysis.mood}</span>
                 </div>
-                <div>
+                <div className="lyria-cascade-in" style={{ '--cascade-i': 2 } as React.CSSProperties}>
                   <span title="Detected energy level from the real audio analysis" className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">ENERGY</span>
                   <span className="text-sm text-lyria-text-main font-medium">{activeVersionData.analysis.energy}%</span>
                   <div className="w-full h-1 rounded-full bg-[#2b2521] mt-1.5 overflow-hidden">
@@ -684,19 +674,19 @@ export function CenterPanel() {
                   </div>
                 </div>
                 {activeVersionData.analysis.bpm !== null && (
-                  <div>
+                  <div className="lyria-cascade-in" style={{ '--cascade-i': 3 } as React.CSSProperties}>
                     <span title="Detected tempo (beats per minute) from the real audio analysis" className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">BPM</span>
                     <span className="text-sm text-lyria-text-main font-mono">{activeVersionData.analysis.bpm}</span>
                   </div>
                 )}
                 {activeVersionData.analysis.key !== null && (
-                  <div>
+                  <div className="lyria-cascade-in" style={{ '--cascade-i': 4 } as React.CSSProperties}>
                     <span title="Detected musical key from the real audio analysis" className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">KEY</span>
                     <span className="text-sm text-lyria-text-main font-mono">{activeVersionData.analysis.key}</span>
                   </div>
                 )}
                 {activeVersionData.analysis.instrumentation.length > 0 && (
-                  <div>
+                  <div className="lyria-cascade-in" style={{ '--cascade-i': 5 } as React.CSSProperties}>
                     <span title="Instruments detected from the real audio analysis" className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">INSTRUMENTATION</span>
                     <div className="flex flex-wrap gap-1 mt-1">
                       {activeVersionData.analysis.instrumentation.map((inst) => (
@@ -731,7 +721,7 @@ export function CenterPanel() {
         )}
 
         {/* Right Stats */}
-        <div className="absolute right-0 top-0 bottom-0 w-48 p-6 flex flex-col justify-center items-end text-right gap-4 z-10 pointer-events-none">
+        <div className="absolute right-0 top-0 bottom-0 w-48 p-6 flex flex-col justify-center items-end text-right gap-4 z-10 pointer-events-none lyria-dim-on-generate">
           <div>
             <span className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">DURATION</span>
             <span className="text-sm text-lyria-text-main font-mono">{modelName === 'LYRIA 3 CLIP' ? '0:30' : durationTarget}</span>
@@ -748,7 +738,7 @@ export function CenterPanel() {
       </div>
 
       {/* Bottom Section: Timeline & Stems */}
-      <div className="flex-1 bg-[#110e0c] rounded-xl border border-lyria-border flex flex-col overflow-hidden relative shadow-[inset_0_2px_10px_rgba(0,0,0,0.5)]">
+      <div className="flex-1 bg-[#110e0c] rounded-xl border border-lyria-border flex flex-col overflow-hidden relative shadow-[inset_0_2px_10px_rgba(0,0,0,0.5)] lyria-dim-on-generate">
         
         {/* Unified Header */}
         <div className="h-10 border-b border-[#2b2521] flex items-center shrink-0 bg-[#161311] w-full">
@@ -802,34 +792,42 @@ export function CenterPanel() {
 
           <div className="flex items-center justify-between p-3 pb-2 border-b border-[#2b2521]/50 bg-gradient-to-b from-transparent to-black/20">
              <div>
-               <span className="font-display text-[9px] text-lyria-gold font-medium tracking-widest block drop-shadow-[0_0_8px_rgba(214,180,133,0.5)]">{selectedSection.name} INSPECTOR</span>
-               <span className="text-[8px] text-lyria-text-muted font-mono mt-1">{selectedSection.timeRange}</span>
+               <span className="font-display text-[9px] text-lyria-gold font-medium tracking-widest block drop-shadow-[0_0_8px_rgba(214,180,133,0.5)]">{(selectedSection?.name || 'SECTION').toUpperCase()} INSPECTOR</span>
+               <span className="text-[8px] text-lyria-text-muted font-mono mt-1">{selectedSection ? selectedSection.rangeLabel : 'detected from the real audio'}</span>
              </div>
           </div>
-          
+
           <div className="flex-1 overflow-y-auto p-3 pt-2 flex flex-col gap-3">
+             {selectedSection && selectedSectionIdx !== null ? (
              <div className="flex flex-col gap-2">
                 <span className="font-display text-[8px] text-lyria-text-muted tracking-widest uppercase mb-0.5 ml-1">Actions</span>
-                
-                <button onClick={() => handleSectionAction('regenerate')} title="Writes a section directive into the prompt and generates a new version" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
+
+                <button onClick={() => handleSectionAction('regenerate')} title="Writes a section directive into the prompt and generates a new version (paid)" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
                   <RefreshCcw size={10} className="opacity-70 text-lyria-gold" /> REGENERATE
                 </button>
-                <button onClick={() => handleSectionAction('extend')} title="Writes a section directive into the prompt and generates a new version" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
+                <button onClick={() => handleSectionAction('extend')} title="Writes a section directive into the prompt and generates a new version (paid)" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
                   <Maximize2 size={10} className="opacity-70 text-lyria-gold" /> EXTEND
                 </button>
-                <button onClick={() => handleSectionAction('restyle')} title="Writes a section directive into the prompt and generates a new version" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
+                <button onClick={() => handleSectionAction('restyle')} title="Writes a section directive into the prompt and generates a new version (paid)" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
                   <Sparkles size={10} className="opacity-70 text-lyria-gold" /> RESTYLE
                 </button>
-                <button onClick={() => handleSectionAction('replace')} title="Writes a section directive into the prompt and generates a new version" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
+                <button onClick={() => handleSectionAction('replace')} title="Writes a section directive into the prompt and generates a new version (paid)" className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-text-main bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] hover:text-lyria-gold border border-[#2b2521] rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer lyria-focus-ring">
                   <RefreshCcw size={10} className="rotate-180 opacity-70 text-lyria-gold" /> REPLACE
                 </button>
 
                 <div className="h-px bg-gradient-to-r from-transparent via-[#2b2521] to-transparent my-1"></div>
 
-                <button onClick={toggleLockSection} title="Pins this section's prompt text — appends a keep-as-is directive" aria-pressed={!!lockedSections[selectedSection.id]} className={`flex items-center justify-center gap-2 px-3 py-1.5 text-[8px] tracking-widest transition-colors duration-150 active:scale-[0.98] cursor-pointer rounded lyria-focus-ring ${lockedSections[selectedSection.id] ? 'text-lyria-gold' : 'text-[#8b837c] hover:text-white'}`}>
-                  <Lock size={10} className="opacity-70" /> {lockedSections[selectedSection.id] ? 'UNLOCK SECTION' : 'LOCK SECTION'}
+                <button onClick={toggleLockSection} title="Pins this section's prompt text — appends a keep-as-is directive" aria-pressed={!!lockedSections[lockKeyFor(selectedSectionIdx)]} className={`flex items-center justify-center gap-2 px-3 py-1.5 text-[8px] tracking-widest transition-colors duration-150 active:scale-[0.98] cursor-pointer rounded lyria-focus-ring ${lockedSections[lockKeyFor(selectedSectionIdx)] ? 'text-lyria-gold' : 'text-[#8b837c] hover:text-white'}`}>
+                  <Lock size={10} className="opacity-70" /> {lockedSections[lockKeyFor(selectedSectionIdx)] ? 'UNLOCK SECTION' : 'LOCK SECTION'}
                 </button>
              </div>
+             ) : (
+               <span className="text-[8px] leading-relaxed tracking-wide text-lyria-text-muted px-1">
+                 {timelineSections.length > 0
+                   ? 'Click a detected section in the timeline to inspect and direct it.'
+                   : 'Sections appear once this version’s audio has been analyzed.'}
+               </span>
+             )}
 
              {/* Real sung lyrics for the active version, when present — the actual paid-for
                  output of a generation, surfaced read-only rather than left with nowhere to show. */}
@@ -842,23 +840,8 @@ export function CenterPanel() {
                </div>
              )}
 
-             {/* Real detected structure from audio analysis — read-only, visually distinct
-                 (dashed muted rows, no lock/select affordances) from the user's editable
-                 target-structure timeline above, since these timestamps come from the
-                 actual generated audio rather than the user's intended layout. */}
-             {activeVersionData?.analysis?.sections && activeVersionData.analysis.sections.length > 0 && (
-               <div className="flex flex-col gap-1.5">
-                 <span title="Song structure detected from the real generated audio (read-only) — distinct from your editable target structure above" className="text-[8px] text-lyria-text-muted tracking-widest uppercase mb-0.5 ml-1">Detected Structure</span>
-                 <div className="flex flex-col rounded-lg border border-dashed border-[#2b2521] bg-[#0d0a08] overflow-hidden">
-                   {activeVersionData.analysis.sections.map((sec, i) => (
-                     <div key={`${sec.name}-${sec.start}-${i}`} className={`flex items-center justify-between px-2 py-1 ${i !== 0 ? 'border-t border-[#2b2521]/60' : ''}`}>
-                       <span className="text-[8px] text-lyria-text-muted tracking-wide uppercase truncate">{sec.name}</span>
-                       <span className="text-[8px] text-lyria-text-muted font-mono shrink-0 ml-2">{sec.start}–{sec.end}</span>
-                     </div>
-                   ))}
-                 </div>
-               </div>
-             )}
+             {/* The timeline header above now renders the detected structure directly —
+                 no duplicate read-only list needed here. */}
           </div>
         </div>
 
@@ -890,29 +873,16 @@ export function CenterPanel() {
                    setZoom(prev => Math.min(Math.max(0.2, prev - e.deltaY * 0.005), 3));
                 }}
              >
-                {/* Grid and Section Highlight Overlay */}
+                {/* Grid and Section Highlight Overlay — real detected sections only */}
                 <div className="absolute top-0 left-0 w-full h-full pointer-events-none z-20 flex" style={{ width: `${1000 * zoom}px`, minWidth: '100%' }}>
-                  {sections.map((sec) => {
-                    const isSelected = selectedSection.id === sec.id;
+                  {timelineSections.map((sec, i) => {
+                    const isSelected = selectedSectionIdx === i;
+                    const isPlayingSection = playingSectionIdx === i;
                     return (
-                      <div key={sec.id} className={`relative h-full border-r border-white/5 ${isSelected ? 'bg-[#b5926c]/[0.02]' : ''}`} style={{ width: `${sec.width}%` }}>
+                      <div key={`${sec.startSeconds}-${i}`} className={`relative h-full border-r border-white/5 ${isSelected ? 'bg-[#b5926c]/[0.02]' : ''} ${isPlayingSection ? 'bg-lyria-gold/[0.04]' : ''}`} style={{ width: `${sec.widthPct}%` }}>
                         {isSelected && (
                           <div className="absolute top-0 bottom-0 left-0 right-0 border-x border-[#b5926c] pointer-events-none">
-                            {/* Bottom Corner handles */}
-                            <div className="absolute -bottom-1 -left-1 w-2 h-2 rounded-full bg-[#b5926c]"></div>
-                            <div className="absolute -bottom-1 -right-1 w-2 h-2 rounded-full bg-[#b5926c]"></div>
-                            {/* Top Corner handles at header boundary (48px is header height) */}
-                            <div 
-                                className="absolute top-11 -left-1 w-2 h-2 rounded-full bg-[#b5926c] pointer-events-auto cursor-col-resize z-50 hover:scale-150 transition-transform duration-150"
-                                onMouseDown={(e) => handleDragStart(e, sec.id, 'left')}
-                            ></div>
-                            <div 
-                                className="absolute top-11 -right-1 w-2 h-2 rounded-full bg-[#b5926c] pointer-events-auto cursor-col-resize z-50 hover:scale-150 transition-transform duration-150"
-                                onMouseDown={(e) => handleDragStart(e, sec.id, 'right')}
-                            ></div>
-                            {/* Top boundary above header */}
                             <div className="absolute top-0 left-0 right-0 h-px bg-[#b5926c]"></div>
-                            {/* Bottom boundary */}
                             <div className="absolute bottom-0 left-0 right-0 h-px bg-[#b5926c]"></div>
                           </div>
                         )}
@@ -921,34 +891,63 @@ export function CenterPanel() {
                   })}
                 </div>
 
-                {/* Sections Header */}
-                <div className="h-12 border-b border-[#2b2521] bg-[#14110f] flex shrink-0 sticky top-0 z-10 transition-all duration-300" style={{ width: `${1000 * zoom}px`, minWidth: '100%' }}>
-                  {sections.map((sec) => {
-                     const isSelected = selectedSection.id === sec.id;
+                {/* Sections Header — structure DETECTED from the active version's real audio
+                    (Analysis.sections scaled by the measured duration). Cells cascade in when
+                    an analysis lands (keyed remount) and the playhead lights up the section
+                    it is currently inside. No analysis → an honest empty/'listening' bar. */}
+                <div
+                  key={`${activeVersionData?.id ?? 'none'}-${timelineSections.length}`}
+                  className="h-12 border-b border-[#2b2521] bg-[#14110f] flex shrink-0 sticky top-0 z-10 transition-all duration-300"
+                  style={{ width: `${1000 * zoom}px`, minWidth: '100%' }}
+                >
+                  {timelineSections.length > 0 ? timelineSections.map((sec, i) => {
+                     const isSelected = selectedSectionIdx === i;
+                     const isPlayingSection = playingSectionIdx === i;
+                     if (sec.isGap) {
+                       return (
+                         <div
+                           key={`${sec.startSeconds}-${i}`}
+                           title={`Unmapped audio — ${sec.rangeLabel}`}
+                           className="border-r border-[#2b2521] flex items-center justify-center text-[9px] text-[#4a443f] font-mono lyria-cascade-in"
+                           style={{ width: `${sec.widthPct}%`, '--cascade-i': i } as React.CSSProperties}
+                         >···</div>
+                       );
+                     }
                      return (
                        <div
-                         key={sec.id}
+                         key={`${sec.startSeconds}-${i}`}
                          role="button"
                          tabIndex={0}
-                         onClick={() => { setSelectedSection(sec); setInspectorOpen(true); }}
+                         onClick={() => setSelectedSectionIdx(i)}
                          onKeyDown={(e) => {
                            if (e.key === 'Enter' || e.key === ' ') {
                              e.preventDefault();
-                             setSelectedSection(sec);
-                             setInspectorOpen(true);
+                             setSelectedSectionIdx(i);
                            }
                          }}
-                         title="Click to inspect; drag edges to resize the target structure"
-                         aria-label={`Inspect ${sec.name} section (${sec.timeRange})`}
-                         className={`border-r border-[#2b2521] p-1.5 px-3 flex flex-col justify-center relative cursor-pointer hover:bg-white/5 transition-colors duration-150 lyria-focus-ring ${isSelected ? 'bg-gradient-to-b from-[#2a231d] to-[#14110f] text-[#b5926c]' : 'text-[#8b837c]'}`}
-                         style={{ width: `${sec.width}%` }}
+                         title={`Detected from the real audio — click to inspect ${sec.name}`}
+                         aria-label={`Inspect ${sec.name} section (${sec.rangeLabel})`}
+                         className={`border-r border-[#2b2521] p-1.5 px-3 flex flex-col justify-center relative cursor-pointer hover:bg-white/5 transition-colors duration-150 lyria-focus-ring lyria-cascade-in ${
+                           isSelected ? 'bg-gradient-to-b from-[#2a231d] to-[#14110f] text-[#b5926c]'
+                           : isPlayingSection ? 'bg-lyria-gold/5 text-lyria-gold'
+                           : 'text-[#8b837c]'
+                         }`}
+                         style={{ width: `${sec.widthPct}%`, '--cascade-i': i } as React.CSSProperties}
                        >
-                         <span className="font-display text-[9px] font-bold tracking-widest truncate uppercase">{sec.name}</span>
-                         <span className="text-[8px] font-mono mt-0.5 truncate">{sec.timeRange}</span>
-                         {lockedSections[sec.id] && <Lock size={8} className="absolute top-1.5 right-1.5 text-lyria-gold/70" />}
+                         <span className={`font-display text-[9px] font-bold tracking-widest truncate uppercase ${isPlayingSection ? 'drop-shadow-[0_0_6px_rgba(214,180,133,0.6)]' : ''}`}>{sec.name}</span>
+                         <span className="text-[8px] font-mono mt-0.5 truncate">{sec.rangeLabel}</span>
+                         {lockedSections[lockKeyFor(i)] && <Lock size={8} className="absolute top-1.5 right-1.5 text-lyria-gold/70" />}
                        </div>
                      );
-                  })}
+                  }) : (
+                    <div className="flex-1 flex items-center px-3">
+                      {activeVersionData?.id && analyzingId === activeVersionData.id ? (
+                        <span className="font-display text-[8px] tracking-[0.3em] uppercase text-lyria-gold/80 animate-pulse">Listening — detecting structure…</span>
+                      ) : activeVersionData?.audioUrl ? (
+                        <span className="font-display text-[8px] tracking-[0.3em] uppercase text-[#4a443f]">No structure mapped — ANALYZE detects sections from the audio</span>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
 
                 {/* Waveform Lanes: always MASTER, plus one sub-row per version.stems entry. */}

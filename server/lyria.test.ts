@@ -1333,6 +1333,20 @@ describe('buildMockAnalysis ($0 dev-mode mock)', () => {
     expect(analysis.title.startsWith('[mock]')).toBe(true);
     expect(analysis.title.length).toBeGreaterThan('[mock]'.length);
   });
+
+  it('derives one clearly-mock-labeled full-take section when a real duration is known', () => {
+    const analysis = buildMockAnalysis('anything', 8);
+    expect(analysis.sections).toEqual([{ name: '[mock] full take', start: '00:00', end: '00:08' }]);
+    // Still round-trips through the real parser with sections present.
+    expect(parseAnalysis(JSON.stringify(analysis))).toEqual(analysis);
+  });
+
+  it('emits no sections without a usable duration — the mock never invents structure', () => {
+    expect(buildMockAnalysis('anything').sections).toEqual([]);
+    expect(buildMockAnalysis('anything', 0).sections).toEqual([]);
+    expect(buildMockAnalysis('anything', NaN).sections).toEqual([]);
+    expect(buildMockAnalysis('anything', -5).sections).toEqual([]);
+  });
 });
 
 describe('analyzeGeneration — LYRIA_MOCK=1 ($0 dev mode, no provider call)', () => {

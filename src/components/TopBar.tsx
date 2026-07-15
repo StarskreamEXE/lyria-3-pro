@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { Settings, ChevronDown, Plus, Archive } from 'lucide-react';
+import { Settings, ChevronDown, Plus, Archive, BookOpen } from 'lucide-react';
 import { SettingsModal } from './SettingsModal';
+import { DocsModal } from './DocsModal';
 import { projectStore } from '../lib/projectStore';
 import { listProjects, type Project } from '../lib/lyriaClient';
 
@@ -25,6 +26,7 @@ export function TopBar() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [isEditingProject, setIsEditingProject] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isDocsOpen, setIsDocsOpen] = useState(false);
   const [isProjectsOpen, setIsProjectsOpen] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
 
@@ -104,6 +106,7 @@ export function TopBar() {
   return (
     <div className="h-16 shrink-0 border-b border-lyria-border flex items-center justify-center px-6 bg-lyria-bg/80 backdrop-blur-sm z-10 relative">
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+      <DocsModal isOpen={isDocsOpen} onClose={() => setIsDocsOpen(false)} />
 
      <div className="w-full max-w-[1600px] mx-auto flex items-center justify-between">
 
@@ -176,6 +179,14 @@ export function TopBar() {
 
       {/* Right: Actions */}
       <div className="flex items-center gap-6">
+        <button
+          onClick={() => setIsDocsOpen(true)}
+          title="Open the documentation — chaptered guide to Lyria 3 Pro & Clip"
+          className="flex flex-col items-center gap-1 text-lyria-text-muted hover:text-lyria-text-main transition-colors duration-150 active:scale-[0.98] cursor-pointer rounded lyria-focus-ring"
+        >
+          <BookOpen size={16} strokeWidth={1.5} />
+          <span className="text-[9px] uppercase tracking-widest">DOCS</span>
+        </button>
         <button
           onClick={() => setIsSettingsOpen(true)}
           title="Open settings — API keys and provider choice"

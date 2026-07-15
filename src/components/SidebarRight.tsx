@@ -295,7 +295,7 @@ export function SidebarRight() {
   };
 
   return (
-    <div className="w-[300px] flex-shrink-0 flex flex-col gap-2 min-h-0">
+    <div className="w-[300px] flex-shrink-0 flex flex-col gap-2 min-h-0 lyria-dim-on-generate">
 
       {/* Tools Grid */}
       <div className="shrink-0 bg-[#110e0c]/85 backdrop-blur-lg rounded-xl border border-[#2b2521] p-3 flex flex-col gap-2 shadow-[0_4px_20px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.03)]">

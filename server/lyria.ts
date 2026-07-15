@@ -1124,14 +1124,28 @@ export function mockEnhancePrompt(prompt: string): string {
 
 const MOCK_ANALYSIS_TITLE_WORDS = 6;
 
+/** Formats seconds as the mm:ss shape real analyses use for section timestamps. */
+function mockTimestamp(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
 /**
  * Deterministic LYRIA_MOCK stand-in for /api/ai/analyze: a fixed, valid Analysis
  * (round-trips through parseAnalysis) titled "[mock] <first words of the generation
- * prompt>". bpm/key stay null and arrays stay empty — the mock never fabricates
- * musical details, matching the real prompt's "don't guess" rule.
+ * prompt>". bpm/key stay null and instrumentation stays empty — the mock never
+ * fabricates musical details, matching the real prompt's "don't guess" rule. The one
+ * exception is derived, not invented: when the manifest carries a real measured
+ * durationSeconds, a single clearly-mock-labeled "[mock] full take" section spanning
+ * exactly 00:00–duration is included so the client's detected-structure timeline can
+ * be exercised end-to-end in $0 dev mode. No duration → no sections.
  */
-export function buildMockAnalysis(prompt: string): Analysis {
+export function buildMockAnalysis(prompt: string, durationSeconds?: number): Analysis {
   const firstWords = prompt.trim().split(/\s+/).filter(Boolean).slice(0, MOCK_ANALYSIS_TITLE_WORDS).join(' ');
+  const sections: AnalysisSection[] =
+    typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && durationSeconds > 0
+      ? [{ name: '[mock] full take', start: mockTimestamp(0), end: mockTimestamp(durationSeconds) }]
+      : [];
   return {
     title: `[mock] ${firstWords || 'untitled'}`,
     genre: 'Mock',
@@ -1140,7 +1154,7 @@ export function buildMockAnalysis(prompt: string): Analysis {
     bpm: null,
     key: null,
     instrumentation: [],
-    sections: [],
+    sections,
     notes: 'Mock analysis produced by LYRIA_MOCK=1 — no AI provider was called.',
   };
 }
@@ -1199,7 +1213,7 @@ export async function analyzeGeneration(options: AnalyzeGenerationOptions): Prom
   // $0 dev mode (LYRIA_MOCK=1): deterministic mock analysis with no key, no audio read,
   // and no provider call — mirrors generateLyria's mock gate. Deliberately NOT persisted.
   if (process.env.LYRIA_MOCK === '1') {
-    return buildMockAnalysis(manifest.prompt);
+    return buildMockAnalysis(manifest.prompt, manifest.durationSeconds);
   }
 
   const format = (manifest.format === 'mp3' ? 'mp3' : 'wav') as 'wav' | 'mp3';

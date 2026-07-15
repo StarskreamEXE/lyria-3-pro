@@ -52,11 +52,25 @@
     .transition-transform,
     .animate-pulse,
     .animate-spin,
-    .animate-bounce {
+    .animate-bounce,
+    .lyria-cascade-in,
+    .lyria-dim-on-generate,
+    #root {
       transition-duration: 0.01ms !important;
       animation-duration: 0.01ms !important;
+      animation-delay: 0ms !important;
       animation-iteration-count: 1 !important;
     }
+  }
+
+  /* One-time app entrance: a subtle fade/settle on load. Killed (0.01ms) under
+     prefers-reduced-motion via the block above. */
+  #root {
+    animation: lyria-app-in 0.6s ease-out both;
+  }
+  @keyframes lyria-app-in {
+    from { opacity: 0; transform: scale(0.992); }
+    to { opacity: 1; transform: scale(1); }
   }
 }
 
@@ -84,6 +98,32 @@
     .lyria-breathe-glow {
       box-shadow: 0 0 8px 1px color-mix(in srgb, var(--color-lyria-gold) 12%, transparent);
     }
+  }
+
+  /* Cinematic generation state: while <html> carries .lyria-generating (set by
+     CenterPanel for exactly the lyria-action-start → lyria-action-end window),
+     everything tagged .lyria-dim-on-generate recedes so the audio-reactive orb owns
+     the room. Pure opacity/filter — zero layout movement; the transition itself is
+     collapsed to 0.01ms under prefers-reduced-motion (see the base-layer block). */
+  .lyria-dim-on-generate {
+    transition: opacity 0.7s ease, filter 0.7s ease;
+  }
+  html.lyria-generating .lyria-dim-on-generate {
+    opacity: 0.35;
+    filter: saturate(0.6);
+  }
+
+  /* Analysis cascade: GENRE/MOOD/ENERGY/BPM/KEY badges and detected-structure timeline
+     cells stagger in as the app finishes listening to its own output. Per-element order
+     comes from the inline --cascade-i custom property. Collapsed to 0.01ms/0ms delay
+     under prefers-reduced-motion (see the base-layer block). */
+  .lyria-cascade-in {
+    animation: lyria-cascade-in 0.45s ease-out both;
+    animation-delay: calc(var(--cascade-i, 0) * 120ms);
+  }
+  @keyframes lyria-cascade-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 }
 

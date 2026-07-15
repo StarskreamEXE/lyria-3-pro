@@ -21,7 +21,9 @@ backups/
 
 # --- Test & tooling artifacts ---
 .playwright-mcp/
-e2e*.png
+# Root-level screenshots are ad-hoc dev/e2e captures; real image assets live
+# under public/, docs/, src/, or assets/.
+/*.png
 *.log
 
 # --- Local agent/editor tooling ---
