@@ -1,0 +1,38 @@
+# --- Dependencies ---
+node_modules/
+
+# --- Build output ---
+build/
+dist/
+coverage/
+*.tsbuildinfo
+
+# --- Secrets & environment ---
+# Ignore all env files EXCEPT the example template.
+.env*
+!.env.example
+
+# --- Runtime-generated data (not source) ---
+generations/
+projects/
+
+# --- Local backups / snapshots ---
+backups/
+
+# --- Test & tooling artifacts ---
+.playwright-mcp/
+e2e*.png
+*.log
+
+# --- Local agent/editor tooling ---
+.serena/
+.claude/settings.local.json
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+Desktop.ini

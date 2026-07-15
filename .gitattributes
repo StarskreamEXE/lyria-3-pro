@@ -1,0 +1,16 @@
+# Normalize line endings across platforms.
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF.
+*.bat text eol=crlf
+
+# Treat binary assets as binary (no line-ending munging, no diff noise).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.wav binary
+*.mp3 binary
+*.woff binary
+*.woff2 binary

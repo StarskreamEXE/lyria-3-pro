@@ -1,0 +1,1251 @@
+<!-- <!doctype html> -->
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="A running clock composed in ∃ — 3 trees, 2 grounds, 2 grasss, raven, magpi, crow, star, origin, 9 connections." />
+  <title>∃ clock</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    /* a11y: respect reduced-motion. The sketch itself honours this via the
+       REDUCED flag in draw(); this CSS rule is belt-and-braces for any
+       background transitions a host page might add. */
+    @media (prefers-reduced-motion: reduce) {
+
+      *,
+      *::before,
+      *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+  <script src="/vendor/p5.min.js"></script>
+</head>
+
+<body aria-label="A running clock composed in ∃ — 3 trees, 2 grounds, 2 grasss, raven, magpi, crow, star, origin, 9 connections.">
+  <script>
+    /* ∃ composition
+{
+  "symbols": [
+    {
+      "id": "s1",
+      "kind": {
+        "type": "Raven"
+      },
+      "position": [
+        107,
+        157.8000030517578
+      ]
+    },
+    {
+      "id": "s2",
+      "kind": {
+        "type": "Magpi"
+      },
+      "position": [
+        440,
+        231.8000030517578
+      ]
+    },
+    {
+      "id": "s4",
+      "kind": {
+        "type": "Ground"
+      },
+      "position": [
+        204,
+        54.80000305175781
+      ],
+      "smallN": 1
+    },
+    {
+      "id": "s5",
+      "kind": {
+        "type": "Crow"
+      },
+      "position": [
+        366,
+        46.80000305175781
+      ]
+    },
+    {
+      "id": "s6",
+      "kind": {
+        "type": "Ground"
+      },
+      "position": [
+        75,
+        46.80000305175781
+      ]
+    },
+    {
+      "id": "s7",
+      "kind": {
+        "type": "Tree"
+      },
+      "position": [
+        51,
+        263.8000030517578
+      ],
+      "color": {
+        "r": 247,
+        "g": 241,
+        "b": 230
+      }
+    },
+    {
+      "id": "s8",
+      "kind": {
+        "type": "Grass"
+      },
+      "position": [
+        334,
+        264.8000030517578
+      ],
+      "bigN": 2,
+      "fadeN": 3
+    },
+    {
+      "id": "s9",
+      "kind": {
+        "type": "Star"
+      },
+      "position": [
+        88,
+        349.79998779296875
+      ]
+    },
+    {
+      "id": "s11",
+      "kind": {
+        "type": "Origin"
+      },
+      "position": [
+        188,
+        443.8000030517578
+      ]
+    },
+    {
+      "id": "s12",
+      "kind": {
+        "type": "Tree"
+      },
+      "position": [
+        36,
+        185.8000030517578
+      ],
+      "color": {
+        "r": 220,
+        "g": 170,
+        "b": 90
+      }
+    },
+    {
+      "id": "s13",
+      "kind": {
+        "type": "Tree"
+      },
+      "position": [
+        43,
+        114.80000305175781
+      ],
+      "color": {
+        "r": 150,
+        "g": 110,
+        "b": 145
+      }
+    },
+    {
+      "id": "s15",
+      "kind": {
+        "type": "Nebula"
+      },
+      "position": [
+        462,
+        419.79998779296875
+      ],
+      "color": {
+        "r": 235,
+        "g": 210,
+        "b": 150
+      }
+    },
+    {
+      "id": "s16",
+      "kind": {
+        "type": "Egg"
+      },
+      "position": [
+        289,
+        365.8000030517578
+      ],
+      "color": {
+        "r": 240,
+        "g": 230,
+        "b": 215
+      }
+    },
+    {
+      "id": "s17",
+      "kind": {
+        "type": "Grass"
+      },
+      "position": [
+        63,
+        499.8000030517578
+      ],
+      "smallN": 2
+    }
+  ],
+  "arrows": [
+    {
+      "id": "a1",
+      "from": "s1",
+      "to": "s2",
+      "modifiers": [
+        {
+          "type": "Add"
+        },
+        {
+          "type": "ConnectedTo"
+        }
+      ]
+    },
+    {
+      "id": "a3",
+      "from": "s5",
+      "to": "s2",
+      "modifiers": [
+        {
+          "type": "Add"
+        },
+        {
+          "type": "ConnectedTo"
+        }
+      ]
+    },
+    {
+      "id": "a4",
+      "from": "m:a3",
+      "to": "s4",
+      "modifiers": [
+        {
+          "type": "ConnectedTo"
+        }
+      ]
+    },
+    {
+      "id": "a5",
+      "from": "s1",
+      "to": "s5",
+      "modifiers": [
+        {
+          "type": "Add"
+        },
+        {
+          "type": "ConnectedTo"
+        }
+      ]
+    },
+    {
+      "id": "a6",
+      "from": "m:a5",
+      "to": "s6",
+      "modifiers": [
+        {
+          "type": "ConnectedTo"
+        }
+      ]
+    },
+    {
+      "id": "a7",
+      "from": "s1",
+      "to": "s9",
+      "modifiers": [
+        {
+          "type": "RendersAs"
+        },
+        {
+          "type": "Color",
+          "r": 247,
+          "g": 241,
+          "b": 230
+        },
+        {
+          "type": "Breathe"
+        }
+      ]
+    },
+    {
+      "id": "a9",
+      "from": "s9",
+      "to": "s11",
+      "modifiers": [
+        {
+          "type": "ConnectedTo"
+        },
+        {
+          "type": "Color",
+          "r": 247,
+          "g": 241,
+          "b": 230
+        }
+      ]
+    },
+    {
+      "id": "a10",
+      "from": "s2",
+      "to": "s9",
+      "modifiers": [
+        {
+          "type": "RendersAs"
+        },
+        {
+          "type": "Color",
+          "r": 247,
+          "g": 241,
+          "b": 230
+        },
+        {
+          "type": "Breathe"
+        }
+      ]
+    },
+    {
+      "id": "a11",
+      "from": "s5",
+      "to": "s9",
+      "modifiers": [
+        {
+          "type": "RendersAs"
+        },
+        {
+          "type": "Color",
+          "r": 247,
+          "g": 241,
+          "b": 230
+        },
+        {
+          "type": "Breathe"
+        }
+      ]
+    }
+  ],
+  "background": {
+    "r": 60,
+    "g": 75,
+    "b": 95
+  },
+  "dials": {
+    "breatheAmp": 0.5,
+    "grassGust": 0.35,
+    "grassDensity": 0.55,
+    "treeDepth": 6,
+    "eggSpeed": 0.1,
+    "groundWeight": 1.5
+  }
+}
+*/
+    var glyphs = {};
+    var clockStart = 0;
+    var scatterPatterns = {};
+    var metaPos = {};
+    var groundPos = {};
+    var grassBlades = {};
+    var nebulaBlobs = {};
+    
+    let speedMultiplier = 5; let targetSpeedMultiplier = 5; let targetIntensity = 1;
+    let intensity = 1;
+    let virtualTime = 0;
+    let lastTime = 0;
+
+    // --- audio reactivity (additive; purely cosmetic on top of the existing
+    // speedMultiplier/intensity/breathe system) --------------------------------
+    // Raw target levels as last reported by AUDIO_LEVELS messages (0..1 each).
+    // Smoothed toward these every frame in draw() with asymmetric attack/release
+    // so the orb "breathes" with the music instead of jittering per-message.
+    let audioTargetBass = 0;
+    let audioTargetMid = 0;
+    let audioTargetHigh = 0;
+    let audioTargetLevel = 0;
+    // Smoothed (displayed) values.
+    let audioBass = 0;
+    let audioMid = 0;
+    let audioHigh = 0;
+    let audioLevel = 0;
+    // Fast attack / slow release lerp constants — musical, not jittery.
+    const AUDIO_ATTACK = 0.4;
+    const AUDIO_RELEASE = 0.08;
+    // Watchdog: if no AUDIO_LEVELS message arrives for this long, ease back to
+    // idle (all-zero) automatically, same as an explicit AUDIO_STOP.
+    const AUDIO_WATCHDOG_MS = 1500;
+    let lastAudioMessageTime = 0;
+    let audioActive = false;
+    // Reduced-motion check scoped ONLY to the new audio-reactive effects; the
+    // sketch's own pre-existing REDUCED flag/behavior (hardcoded false in
+    // draw()) is left completely untouched so idle/action visuals are unchanged.
+    const AUDIO_REDUCED_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+    // ACTION state is refcounted: multiple independent writers overlap (BottomBar's
+    // transport posts ACTION_START/END around play/pause while CenterPanel forwards
+    // lyria-action-start/end around generations), so a single boolean would let one
+    // writer's END cancel the other's still-active START. The counter increments on
+    // ACTION_START, decrements on ACTION_END (clamped at >= 0 so an unmatched END is
+    // harmless), and the sped-up state stays active while the counter is > 0.
+    let actionRefCount = 0;
+
+    window.addEventListener('message', (event) => {
+        // Only accept messages from our own origin — the parent app is same-origin;
+        // anything else (embedding, injected frames) is ignored outright.
+        if (event.origin !== location.origin) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'ACTION_START' || data.type === 'ACTION_END') {
+            if (data.type === 'ACTION_START') {
+                actionRefCount += 1;
+            } else {
+                actionRefCount = Math.max(0, actionRefCount - 1);
+            }
+            const actionActive = actionRefCount > 0;
+            targetSpeedMultiplier = actionActive ? 15.0 : 5.0;
+            targetIntensity = actionActive ? 3.0 : 1.0;
+        } else if (data.type === 'AUDIO_LEVELS') {
+            const bands = data.bands || {};
+            const clamp01 = (n) => (typeof n === 'number' && isFinite(n)) ? Math.max(0, Math.min(1, n)) : 0;
+            audioTargetBass = clamp01(bands.bass);
+            audioTargetMid = clamp01(bands.mid);
+            audioTargetHigh = clamp01(bands.high);
+            audioTargetLevel = clamp01(data.level);
+            lastAudioMessageTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            audioActive = true;
+        } else if (data.type === 'AUDIO_STOP') {
+            audioTargetBass = 0;
+            audioTargetMid = 0;
+            audioTargetHigh = 0;
+            audioTargetLevel = 0;
+            audioActive = false;
+        } else if (data.type === 'SET_STATE') {
+            // handle
+        }
+    });
+
+var t = 0;
+    var REDUCED = false;
+    let D = (window.dials = Object.assign({
+      "breatheAmp": 0.16,
+      "grassGust": 0.35,
+      "grassDensity": 0.55,
+      "treeDepth": 5,
+      "eggSpeed": 0.5,
+      "groundWeight": 1.5
+    }, window.dials || {}));
+
+    function preload() {}
+
+    function setup() {
+      pixelDensity(displayDensity());
+      const side = min(windowWidth, windowHeight);
+      createCanvas(side, side);
+      imageMode(CENTER);
+      clockStart = hour() * 3600 + minute() * 60 + second();
+      groundPos['s4'] = [];
+      for (let i = 0; i < 1200; i++) {
+        const sT = i * 3;
+        groundPos['s4'].push({
+          x: 0.30 * cos(-PI / 2 + sT * TWO_PI / 3600) + 0.40 * cos(-PI / 2 + sT * TWO_PI / 60),
+          y: 0.30 * sin(-PI / 2 + sT * TWO_PI / 3600) + 0.40 * sin(-PI / 2 + sT * TWO_PI / 60)
+        });
+      }
+      groundPos['s6'] = [];
+      for (let i = 0; i < 720; i++) {
+        const sT = i * 60;
+        groundPos['s6'].push({
+          x: 0.20 * cos(-PI / 2 + sT * TWO_PI / 43200) + 0.30 * cos(-PI / 2 + sT * TWO_PI / 3600),
+          y: 0.20 * sin(-PI / 2 + sT * TWO_PI / 43200) + 0.30 * sin(-PI / 2 + sT * TWO_PI / 3600)
+        });
+      }
+    }
+
+    function windowResized() {
+      const side = min(windowWidth, windowHeight);
+      resizeCanvas(side, side);
+      grassBlades = {};
+      nebulaBlobs = {};
+    }
+
+    function stringHash(s) {
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+      return Math.abs(h) || 1;
+    }
+
+    function getScatterPattern(arrowId) {
+      let p = scatterPatterns[arrowId];
+      if (p) return p;
+      let state = stringHash(arrowId);
+      const rnd = () => {
+        state = (state * 1103515245 + 12345) & 0x7fffffff;
+        return state / 0x7fffffff;
+      };
+      const gaussian = () => {
+        const u1 = rnd() || 0.0001;
+        const u2 = rnd();
+        return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      };
+      p = [];
+      for (let i = 0; i < 24; i++) p.push({
+        x: gaussian(),
+        y: gaussian()
+      });
+      scatterPatterns[arrowId] = p;
+      return p;
+    }
+
+    function scatterOffset(o, i, spread, arrPhase) {
+      const ph = i * 1.7 + arrPhase;
+      const wobX = sin(t * 0.4 + ph) * 0.25;
+      const wobY = cos(t * 0.5 + ph * 1.3) * 0.25;
+      return {
+        x: (o.x + wobX) * spread,
+        y: (o.y + wobY) * spread
+      };
+    }
+
+    function getDanceOffsets(arrowId, spread) {
+      const pat = getScatterPattern(arrowId);
+      const arrPhase = stringHash(arrowId) * 0.013;
+      const out = [];
+      for (let i = 0; i < pat.length; i++) {
+        out.push(scatterOffset(pat[i], i, spread, arrPhase));
+      }
+      return out;
+    }
+    // Organic, slow, asymmetric pulse. Three sinusoids at different periods are
+    // combined via sin × cos − sin, so the amplitude wanders rather than
+    // repeating cleanly. arrowId-derived phases mean each pulsing element
+    // starts at its own moment, so a row of breathing glyphs reads as a chord
+    // instead of a metronome.
+    function breatheFactor(arrowId, t) {
+      const seed = stringHash(arrowId);
+      const p1 = seed * 0.0131;
+      const p2 = seed * 0.0173;
+      const p3 = seed * 0.0109;
+      const a = D.breatheAmp;
+      return 1 +
+        a * sin(t * 0.42 + p1) * cos(t * 0.61 + p2) -
+        (a * 0.625) * sin(t * 0.27 + p3);
+    }
+
+    function renderAt(kind, p, R, opts) {
+      const s = (opts && opts.scale) || 1;
+      const rot = (opts && opts.rot) || 0;
+      const col = opts && opts.col;
+      const fade = (opts && opts.fade != null) ? opts.fade : 1;
+      if (kind === 'Sun') drawSun(p, R, s, rot, col, fade);
+      else if (kind === 'Moon') drawMoon(p, R, s, rot, col, fade);
+      else if (kind === 'Star') drawStar(p, R, s, rot, col, fade);
+      else if (kind === 'Egg') drawEgg(p, R, s, rot, col, fade);
+      else {
+        noStroke();
+        if (col) fill(col[0], col[1], col[2], col[3] * fade);
+        else fill(180, 200 * fade);
+        ellipse(p.x, p.y, R * 0.05 * s);
+      }
+    }
+
+    function drawStar(p, R, s, rot, col, fade) {
+      noStroke();
+      if (col) fill(col[0], col[1], col[2], col[3] * fade);
+      else fill(150, 140, 200, 230 * fade);
+      circle(p.x, p.y, R * 0.045 * s);
+    }
+
+    function drawSun(p, R, s, rot, col, fade) {
+      push();
+      translate(p.x, p.y);
+      rotate(rot || 0);
+      if (col) stroke(col[0], col[1], col[2], col[3] * fade);
+      else stroke(207, 168, 116, 220 * fade);
+      strokeWeight(1.5);
+      noFill();
+      const rays = 12;
+      const inner = R * 0.02 * s;
+      const outer = R * 0.06 * s;
+      for (let i = 0; i < rays; i++) {
+        const a = (TWO_PI / rays) * i;
+        line(inner * cos(a), inner * sin(a), outer * cos(a), outer * sin(a));
+      }
+      pop();
+    }
+
+    function drawMoon(p, R, s, rot, col, fade) {
+      push();
+      translate(p.x, p.y);
+      // Tidally lock the crescent so its open side faces away from centre.
+      rotate((rot || 0) + PI / 2);
+      if (col) stroke(col[0], col[1], col[2], col[3] * fade);
+      else stroke(190, 200, 220, 230 * fade);
+      strokeWeight(2);
+      noFill();
+      const d = R * 0.10 * s;
+      arc(0, 0, d, d, -PI / 2 - PI / 4, PI / 2 - PI / 4);
+      pop();
+    }
+
+    function drawEgg(p, R, s, rot, col, fade) {
+      push();
+      translate(p.x, p.y);
+      rotate(rot || 0);
+      noStroke();
+      if (col) fill(col[0], col[1], col[2], col[3] * fade);
+      else fill(230, 220, 200, 220 * fade);
+      ellipse(0, 0, R * 0.04 * s, R * 0.055 * s);
+      pop();
+    }
+    // --- palette -------------------------------------------------------------
+    // Turquoise, sage, misty-blue, plum, coffee-with-cream. Soft and muted.
+    function palettePick(rnd) {
+      const k = rnd();
+      if (k < 0.40) return [105 + rnd() * 30, 160 + rnd() * 25, 165 + rnd() * 25]; // turquoise
+      if (k < 0.70) return [130 + rnd() * 30, 160 + rnd() * 25, 140 + rnd() * 25]; // sage
+      return [115 + rnd() * 25, 145 + rnd() * 25, 175 + rnd() * 20]; // misty blue
+    }
+    // --- grass field ---------------------------------------------------------
+    // Blades sit just inside R around the full circle, pointing inward toward
+    // the centre "sky". Each blade is two bezier arcs sharing a tip and a base.
+    // Breeze: two per-blade oscillators at different periods + a slow coherent
+    // gust that sweeps around the rim.
+    //
+    // Density and length variation grow with the instance index so stacking
+    // grass nodes layers progressively richer, more varied fields.
+    function getGrassBlades(R, instanceIdx, seed) {
+      const key = ((R | 0) * 7919) ^ (seed | 0);
+      let blades = grassBlades[key];
+      if (blades) return blades;
+      let st = (seed | 0) || 1;
+      const rnd = () => {
+        st = (st * 1664525 + 1013904223) & 0x7fffffff;
+        return st / 0x7fffffff;
+      };
+      // Starting angle of the band is part of the seed, so two grass instances
+      // don't share the same first-blade position.
+      const startAngle = rnd() * TWO_PI;
+      const N = floor((280 + (instanceIdx % 3) * 100) * D.grassDensity); // 280, 380, 480
+      blades = new Array(N);
+      for (let i = 0; i < N; i++) {
+        const a = startAngle + (i / N) * TWO_PI + (rnd() - 0.5) * 0.10;
+        const c = palettePick(rnd);
+        blades[i] = {
+          angle: a,
+          base: R * (0.99 - rnd() * 0.06),
+          // Wider range: short tufts to tall stalks.
+          len: R * (0.04 + rnd() * 0.32),
+          baseW: 1.8 + rnd() * 4.5,
+          tipW: 0.3 + rnd() * 1.3,
+          r: c[0],
+          g: c[1],
+          b: c[2],
+          al: 110 + rnd() * 110,
+          f1: 0.30 + rnd() * 0.85,
+          f2: 0.20 + rnd() * 0.65,
+          p1: rnd() * TWO_PI,
+          p2: rnd() * TWO_PI,
+          a1: 2 + rnd() * 5,
+          a2: 1 + rnd() * 3,
+        };
+      }
+      grassBlades[key] = blades;
+      return blades;
+    }
+
+    function drawGrassBackdrop(R, t, H, instanceIdx, seed, tint, fade, scale) {
+      fade = fade != null ? fade : 1;
+      scale = scale != null ? scale : 1;
+      const blades = getGrassBlades(R, instanceIdx, seed);
+      const gust = sin(t * 0.18) * D.grassGust;
+      noStroke();
+      for (let i = 0; i < blades.length; i++) {
+        const b = blades[i];
+        const gustHere = gust * cos(b.angle - t * 0.07) * 3;
+        const sway1 = sin(t * b.f1 + b.p1) * b.a1 + gustHere;
+        const sway2 = cos(t * b.f2 + b.p2) * b.a2;
+        const ln = b.len * scale;
+        const bw = b.baseW * scale;
+        const tw = b.tipW * scale;
+        push();
+        rotate(b.angle);
+        translate(b.base, 0);
+        rotate(PI);
+        if (tint) fill(tint[0], tint[1], tint[2], tint[3] * fade);
+        else fill(b.r, b.g, b.b, b.al * fade);
+        beginShape();
+        vertex(0, -bw);
+        bezierVertex(
+          ln * 0.30, -bw + sway1,
+          ln * 0.70, -tw + sway1 + sway2,
+          ln, 0
+        );
+        bezierVertex(
+          ln * 0.70, tw + sway1 + sway2,
+          ln * 0.30, bw + sway1,
+          0, bw
+        );
+        endShape(CLOSE);
+        pop();
+      }
+    }
+    // --- tree (L-system-shaped, noise-perturbed, coffee tones) ---------------
+    // N = floor(H) trees evenly around the perimeter, pointing inward. The
+    // pattern's starting rotation and the per-tree angular jitter are both
+    // seed-derived, so dropping a second tree node gives a *different*
+    // rotated forest — not the same one offset by a fixed amount.
+    function drawTreeBackdrop(R, t, H, instanceIdx, seed, tint, fade, scale) {
+      fade = fade != null ? fade : 1;
+      scale = scale != null ? scale : 1;
+      const N = max(1, floor(H || 12));
+      let st = (seed | 0) || 1;
+      const rnd = () => {
+        st = (st * 1664525 + 1013904223) & 0x7fffffff;
+        return st / 0x7fffffff;
+      };
+      const startAngle = rnd() * TWO_PI;
+      if (tint) stroke(tint[0], tint[1], tint[2], tint[3] * fade);
+      else stroke(139, 131, 124, 180 * fade);
+      noFill();
+      for (let i = 0; i < N; i++) {
+        const jitter = (rnd() - 0.5) * 0.10;
+        push();
+        rotate(startAngle + (TWO_PI / N) * i + jitter);
+        translate(R * 0.92, 0);
+        rotate(PI);
+        treeBranch(R * 0.14 * scale, floor(D.treeDepth), t, seed + i * 11);
+        pop();
+      }
+    }
+
+    function treeBranch(len, depth, t, seed) {
+      if (depth === 0 || len < 1) return;
+      strokeWeight(max(0.6, depth * 0.7));
+      const swayAmp = (5 - depth) * 0.045;
+      rotate((noise(seed * 0.31, t * 0.22) - 0.5) * swayAmp);
+      line(0, 0, len, 0);
+      push();
+      translate(len, 0);
+      const base = 0.42;
+      const a1 = base + (noise(seed * 0.13 + 1, t * 0.15) - 0.5) * 0.30;
+      const a2 = base + (noise(seed * 0.17 + 5, t * 0.15) - 0.5) * 0.30;
+      push();
+      rotate(-a1);
+      treeBranch(len * 0.72, depth - 1, t, seed * 2 + 1);
+      pop();
+      push();
+      rotate(a2);
+      treeBranch(len * 0.72, depth - 1, t, seed * 2 + 2);
+      pop();
+      if (depth >= 3 && noise(seed * 0.41 + 9) > 0.5) {
+        push();
+        rotate((a2 - a1) * 0.4);
+        treeBranch(len * 0.55, depth - 1, t, seed * 2 + 3);
+        pop();
+      }
+      pop();
+    }
+    // --- ground (orbit-trace backdrop, plum line) ---------------------------
+    // Optional vector source feeds the trace; when not wired it draws a default
+    // faint circle as a placeholder. Source key is the ground symbol id; its
+    // precomputed sample positions live in groundPos[key]. Scale resizes the
+    // trace radius, fade softens alpha, tint replaces the default plum colour.
+    function drawGroundBackdrop(R, t, H, instanceIdx, seed, tint, fade, scale, sourceKey) {
+      fade = fade != null ? fade : 1;
+      scale = scale != null ? scale : 1;
+      push();
+      if (tint) stroke(tint[0], tint[1], tint[2], tint[3] * fade);
+      else stroke(214, 180, 133, 150 * fade);
+      // Big/Small on the Ground node controls stroke weight; the underlying
+      // sample count is already adjusted at setup time. Wired-trace radius
+      // stays at the source's natural orbit (not user-scaled) since that's
+      // where the actual orbit is.
+      strokeWeight(D.groundWeight * scale);
+      noFill();
+      const pat = sourceKey ? groundPos[sourceKey] : null;
+      if (!pat || pat.length === 0) {
+        // No source wired — default placeholder is an unfilled circle at a
+        // representative orbit radius. Scales with Big/Small since there's no
+        // natural source radius to anchor to.
+        circle(0, 0, R * 0.6 * scale);
+        pop();
+        return;
+      }
+      beginShape();
+      for (let i = 0; i < pat.length; i++) {
+        vertex(pat[i].x * R, pat[i].y * R);
+      }
+      endShape(CLOSE);
+      pop();
+    }
+    // --- nebula (rotationally symmetric bokeh + pin-stars, pale palette) ----
+    // Seeded per-instance layout: 5–8 fold symmetry, 3–5 concentric rings, each
+    // ring is either bokeh (soft large discs, very low alpha) or stars (small
+    // bright pin-dots). Drifts gently with time so the field doesn't sit dead
+    // still. Cached by R⊕seed so we precompute the positions once.
+    function getNebulaBlobs(R, instanceIdx, seed, H) {
+      // Symmetry order is clock-coupled: 12 × floor(H), min 12. At noon you get
+      // 144-fold symmetry — a dense ring of stars or atmospheric bokeh. At
+      // midnight the floor of 12 keeps it from collapsing. Cache keyed by
+      // (R, seed, hour) so the structure regenerates at each hour boundary
+      // and otherwise stays stable.
+      const hour = max(1, floor(H || 12));
+      const N = hour * 12;
+      const key = (((R | 0) * 7919) ^ (seed | 0)) + hour * 1000003;
+      let blobs = nebulaBlobs[key];
+      if (blobs) return blobs;
+      let st = (seed | 0) || 1;
+      const rnd = () => {
+        st = (st * 1664525 + 1013904223) & 0x7fffffff;
+        return st / 0x7fffffff;
+      };
+      const startAngle = rnd() * TWO_PI;
+      const numRings = 4 + floor(rnd() * 3); // 4–6 rings
+      blobs = [];
+      for (let r = 0; r < numRings; r++) {
+        const ringRadius = R * (0.06 + r * 0.15);
+        const isBokeh = rnd() < 0.55; // 55% bokeh, 45% star
+        // Every ring shares the full symmetry order so the rotational pattern
+        // reads cleanly across all of them.
+        for (let i = 0; i < N; i++) {
+          const angle = startAngle + (TWO_PI / N) * i + (rnd() - 0.5) * 0.15;
+          const radiusJitter = 1 + (rnd() - 0.5) * 0.15;
+          const x = ringRadius * radiusJitter * cos(angle);
+          const y = ringRadius * radiusJitter * sin(angle);
+          let size, alpha;
+          if (isBokeh) {
+            // Power distribution biases toward smaller; the squared-cubed tail
+            // gives the occasional huge atmospheric disc up to ~0.30R.
+            size = R * (0.03 + pow(rnd(), 2.5) * 0.27);
+            alpha = 15 + rnd() * 50;
+          } else {
+            // Stars span from near-invisible pin-dots to small bright sparks.
+            size = R * (0.001 + pow(rnd(), 2) * 0.022);
+            alpha = 150 + rnd() * 100;
+          }
+          // Hue families pulled across the canonical palette so the field
+          // catches different lights — cool blues, plum/lavender, warm gold,
+          // sage/teal. Saturation kept low (pastel) so individual blobs still
+          // read as light rather than colour.
+          const family = rnd();
+          let cr, cg, cb;
+          if (family < 0.30) {
+            // cool blue
+            cr = 150 + rnd() * 60;
+            cg = 170 + rnd() * 50;
+            cb = 200 + rnd() * 50;
+          } else if (family < 0.55) {
+            // plum / lavender
+            cr = 180 + rnd() * 60;
+            cg = 150 + rnd() * 50;
+            cb = 180 + rnd() * 55;
+          } else if (family < 0.78) {
+            // warm gold / peach
+            cr = 220 + rnd() * 35;
+            cg = 190 + rnd() * 45;
+            cb = 155 + rnd() * 45;
+          } else {
+            // sage / teal
+            cr = 150 + rnd() * 55;
+            cg = 185 + rnd() * 45;
+            cb = 170 + rnd() * 50;
+          }
+          blobs.push({
+            x,
+            y,
+            size,
+            alpha,
+            r: cr,
+            g: cg,
+            b: cb,
+            phase: rnd() * TWO_PI,
+            driftR: 1.5 + rnd() * 2,
+          });
+        }
+      }
+      nebulaBlobs[key] = blobs;
+      return blobs;
+    }
+
+    function drawNebulaBackdrop(R, t, H, instanceIdx, seed, tint, fade, scale) {
+      fade = fade != null ? fade : 1;
+      scale = scale != null ? scale : 1;
+      const blobs = getNebulaBlobs(R, instanceIdx, seed, H);
+      noStroke();
+      for (let i = 0; i < blobs.length; i++) {
+        const b = blobs[i];
+        // Slow gentle drift so the field breathes without distracting.
+        const dx = cos(b.phase + t * 0.08) * b.driftR;
+        const dy = sin(b.phase + t * 0.06) * b.driftR;
+        if (tint) fill(tint[0], tint[1], tint[2], b.alpha * fade);
+        else fill(b.r, b.g, b.b, b.alpha * fade);
+        circle(b.x + dx, b.y + dy, b.size * scale);
+      }
+    }
+    // --- egg (light radially-symmetric ellipses with small orbits, plum) ----
+    // Symmetry order = 3 × floor(H). Per-instance phase offset spreads stacked
+    // eggs into a richer rosette.
+    function drawEggBackdrop(R, t, H, instanceIdx, seed, tint, fade, scale) {
+      fade = fade != null ? fade : 1;
+      scale = scale != null ? scale : 1;
+      const N = max(3, floor(H || 12) * 3);
+      let st = (seed | 0) || 1;
+      const rnd = () => {
+        st = (st * 1664525 + 1013904223) & 0x7fffffff;
+        return st / 0x7fffffff;
+      };
+      const startAngle = rnd() * TWO_PI;
+      const sr = tint ? tint[0] : 200,
+        sg = tint ? tint[1] : 180,
+        sb = tint ? tint[2] : 195,
+        sa = (tint ? tint[3] : 130) * fade;
+      const fr = tint ? tint[0] : 150,
+        fg = tint ? tint[1] : 110,
+        fb = tint ? tint[2] : 145,
+        fa = (tint ? min(255, (tint[3] || 220) + 40) : 200) * fade;
+      push();
+      rotate(startAngle);
+      for (let i = 0; i < N; i++) {
+        push();
+        rotate((TWO_PI / N) * i);
+        const w = R * 0.55 * scale;
+        const h = R * 0.13 * scale;
+        translate(w / 2, 0);
+        noFill();
+        stroke(sr, sg, sb, sa);
+        strokeWeight(0.8);
+        ellipse(0, 0, w, h);
+        for (let k = 0; k < 2; k++) {
+          const phase = t * D.eggSpeed + i * 0.3 + k * PI;
+          const ox = (w / 2) * cos(phase);
+          const oy = (h / 2) * sin(phase);
+          noStroke();
+          fill(fr, fg, fb, fa);
+          circle(ox, oy, R * 0.014);
+        }
+        pop();
+      }
+      pop();
+    }
+
+    function draw() {
+      clear();
+      translate(width / 2, height / 2);
+      const R = min(width, height) * 0.45;
+      REDUCED = false;
+      
+      let currentMillis = millis() / 1000;
+      if (lastTime === 0) lastTime = currentMillis;
+      let delta = currentMillis - lastTime;
+      lastTime = currentMillis;
+
+      speedMultiplier += (targetSpeedMultiplier - speedMultiplier) * 0.05;
+      intensity += (targetIntensity - intensity) * 0.05;
+
+      // --- audio-reactive watchdog + smoothing ------------------------------
+      // If no AUDIO_LEVELS has arrived in AUDIO_WATCHDOG_MS, treat it exactly
+      // like AUDIO_STOP so a sender that dies/pauses doesn't leave the orb
+      // stuck mid-pulse. Purely additive: when nothing has ever been sent,
+      // all audioTarget* stay at their initial 0 and every audio-derived value
+      // below resolves to its neutral/idle constant, so idle rendering is
+      // byte-for-byte the same as before this feature existed.
+      const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      if (audioActive && lastAudioMessageTime && (nowMs - lastAudioMessageTime) > AUDIO_WATCHDOG_MS) {
+        audioTargetBass = 0;
+        audioTargetMid = 0;
+        audioTargetHigh = 0;
+        audioTargetLevel = 0;
+        audioActive = false;
+      }
+      // Asymmetric lerp: fast attack (hits accent quickly), slow release
+      // (eases back out over ~1s), capped per-frame so nothing can strobe.
+      const lerpAudio = (cur, target) => {
+        const k = (target > cur) ? AUDIO_ATTACK : AUDIO_RELEASE;
+        return cur + (target - cur) * k;
+      };
+      audioBass = lerpAudio(audioBass, audioTargetBass);
+      audioMid = lerpAudio(audioMid, audioTargetMid);
+      audioHigh = lerpAudio(audioHigh, audioTargetHigh);
+      audioLevel = lerpAudio(audioLevel, audioTargetLevel);
+
+      // In reduced-motion mode, audio reactivity collapses to gentle
+      // brightness-only (no scale pulse, no rotation-speed modulation, no
+      // sparkle jitter) — mirroring how the sketch already suppresses motion
+      // via its REDUCED flag elsewhere.
+      const audioMotionOK = !AUDIO_REDUCED_MOTION;
+      // bass -> core scale pulse (1.0–1.12) + a touch of extra glow alpha.
+      const audioBassScale = audioMotionOK ? (1 + audioBass * 0.12) : 1;
+      const audioGlowBoost = 1 + audioBass * 0.35 * (audioMotionOK ? 1 : 0.4);
+      // mid -> extra rotation-speed modulation layered on speedMultiplier,
+      // applied only to virtualTime advance (never touches the
+      // ACTION_START/END target system itself).
+      const audioRotationMod = audioMotionOK ? (1 + audioMid * 0.5) : 1;
+      // high -> sparkle/detail intensity, applied to the nebula's fine
+      // star-point layer fade (drawNebulaBackdrop's existing fade param).
+      const audioSparkleBoost = 1 + audioHigh * 0.6 * (audioMotionOK ? 1 : 0);
+      // overall level -> global brightness/bloom fade multiplier applied
+      // across backdrop layers.
+      const audioBrightness = 1 + audioLevel * 0.25 * (audioMotionOK ? 1 : 0.5);
+
+      virtualTime += delta * speedMultiplier * audioRotationMod;
+      const tClock = virtualTime;
+
+      t = REDUCED ? 0 : tClock;
+      const now = clockStart + tClock;
+      const H = (now / 3600) % 12;
+      const M = (now / 60) % 60;
+      const S = now % 60;
+      // Nebula carries the sketch's existing fine bokeh/pin-star detail layer,
+      // so it's the natural hook for "high" (sparkle/detail intensity); its
+      // fade is also scaled by overall audioBrightness like the other
+      // backdrops. When idle (audioSparkleBoost === 1, audioBrightness === 1)
+      // this is identical to the original literal `1`.
+      drawNebulaBackdrop(R, t, H, 0, 92952176, [214, 180, 133, 220], 1 * audioSparkleBoost * audioBrightness, 1);
+      drawGroundBackdrop(R, t, H, 0, 2816734, null, 1 * audioBrightness, 0.6, 's4');
+      drawGroundBackdrop(R, t, H, 1, 2816736, null, 1 * audioBrightness, 1, 's6');
+      drawGrassBackdrop(R, t, H, 0, 2816738, null, pow(0.6, 3) * audioBrightness, pow(1.6, 2));
+      drawGrassBackdrop(R, t, H, 1, 92952178, null, 1 * audioBrightness, pow(0.6, 2));
+      drawTreeBackdrop(R, t, H, 0, 2816737, [232, 201, 158, 220], 1 * audioBrightness, 1);
+      drawTreeBackdrop(R, t, H, 1, 92952173, [207, 168, 116, 220], 1 * audioBrightness, 1);
+      drawTreeBackdrop(R, t, H, 2, 92952174, [139, 131, 124, 220], 1 * audioBrightness, 1);
+      drawEggBackdrop(R, t, H, 0, 92952177, [232, 201, 158, 220], 1 * audioBrightness, 1);
+      const baseV = {};
+      baseV['s1'] = {
+        x: R * 0.20 * cos(-PI / 2 + H * TWO_PI / 12),
+        y: R * 0.20 * sin(-PI / 2 + H * TWO_PI / 12)
+      };
+      baseV['s2'] = {
+        x: R * 0.40 * cos(-PI / 2 + S * TWO_PI / 60),
+        y: R * 0.40 * sin(-PI / 2 + S * TWO_PI / 60)
+      };
+      baseV['s5'] = {
+        x: R * 0.30 * cos(-PI / 2 + M * TWO_PI / 60),
+        y: R * 0.30 * sin(-PI / 2 + M * TWO_PI / 60)
+      };
+      const opIncoming = {};
+      const arrows = {
+        'a3': {
+          from: 's5',
+          to: 's2',
+          mod: 'add'
+        },
+        'a5': {
+          from: 's1',
+          to: 's5',
+          mod: 'add'
+        }
+      };
+      const v = {};
+      const mid = {};
+
+      function valueOf(ref) {
+        if (typeof ref === 'string' && ref.startsWith('m:')) return midOf(ref.slice(2));
+        return effective(ref);
+      }
+
+      function effective(id) {
+        if (id in v) return v[id];
+        // Placeholder breaks cycles: if a downstream call resolves the same id
+        // we'd otherwise recurse forever (corrupt imports, ill-formed chains).
+        v[id] = {
+          x: 0,
+          y: 0
+        };
+        let x = 0,
+          y = 0;
+        if (id in baseV) {
+          x = baseV[id].x;
+          y = baseV[id].y;
+        }
+        for (const [src, op] of opIncoming[id] || []) {
+          const e = valueOf(src);
+          const tr = applyOp(e, op);
+          x += tr.x;
+          y += tr.y;
+        }
+        v[id] = {
+          x,
+          y
+        };
+        return v[id];
+      }
+
+      function midOf(aid) {
+        if (aid in mid) return mid[aid];
+        const a = arrows[aid];
+        if (!a) {
+          mid[aid] = {
+            x: 0,
+            y: 0
+          };
+          return mid[aid];
+        }
+        // Same cycle break — set placeholder before recursive valueOf so a
+        // self-referencing midpoint chain returns (0,0) instead of overflowing.
+        mid[aid] = {
+          x: 0,
+          y: 0
+        };
+        const fromV = valueOf(a.from);
+        const toV = valueOf(a.to);
+        const tr = applyOp(fromV, a.mod);
+        mid[aid] = {
+          x: tr.x + toV.x,
+          y: tr.y + toV.y
+        };
+        return mid[aid];
+      }
+
+      function applyOp(e, op) {
+        if (op === 'muli') return {
+          x: -e.y,
+          y: e.x
+        };
+        if (op === 'sub') return {
+          x: -e.x,
+          y: -e.y
+        }; // midpoint = to − from
+        if (op === 'sin') return {
+          x: sin(e.x),
+          y: sin(e.y)
+        };
+        if (op === 'cos') return {
+          x: cos(e.x),
+          y: cos(e.y)
+        };
+        if (op === 'scale') return {
+          x: e.x * R,
+          y: e.y * R
+        };
+        return {
+          x: e.x,
+          y: e.y
+        };
+      }
+      effective('s1');
+      effective('s2');
+      effective('s5'); {
+        strokeWeight(1.5);
+        const _c = null;
+        const _f = 1;
+        if (_c) stroke(_c[0], _c[1], _c[2], _c[3] * _f);
+        else stroke(214, 180, 133, 200 * _f);
+        const _fp = valueOf('s1');
+        const _tp = valueOf('s2');
+        line(_fp.x, _fp.y, _tp.x, _tp.y);
+      } {
+        strokeWeight(1.5);
+        const _c = null;
+        const _f = 1;
+        if (_c) stroke(_c[0], _c[1], _c[2], _c[3] * _f);
+        else stroke(214, 180, 133, 200 * _f);
+        const _fp = valueOf('s5');
+        const _tp = valueOf('s2');
+        line(_fp.x, _fp.y, _tp.x, _tp.y);
+      } {
+        strokeWeight(1.5);
+        const _c = null;
+        const _f = 1;
+        if (_c) stroke(_c[0], _c[1], _c[2], _c[3] * _f);
+        else stroke(214, 180, 133, 200 * _f);
+        const _fp = valueOf('s1');
+        const _tp = valueOf('s5');
+        line(_fp.x, _fp.y, _tp.x, _tp.y);
+      } {
+        strokeWeight(1.5);
+        const _c = [232, 201, 158, 220];
+        const _f = 1;
+        if (_c) stroke(_c[0], _c[1], _c[2], _c[3] * _f);
+        else stroke(214, 180, 133, 200 * _f);
+      } {
+        const p = valueOf('s1');
+        line(0, 0, p.x, p.y);
+      } {
+        strokeWeight(1.5);
+        const _c = [232, 201, 158, 220];
+        const _f = 1;
+        if (_c) stroke(_c[0], _c[1], _c[2], _c[3] * _f);
+        else stroke(214, 180, 133, 200 * _f);
+      } {
+        const p = valueOf('s2');
+        line(0, 0, p.x, p.y);
+      } {
+        strokeWeight(1.5);
+        const _c = [232, 201, 158, 220];
+        const _f = 1;
+        if (_c) stroke(_c[0], _c[1], _c[2], _c[3] * _f);
+        else stroke(214, 180, 133, 200 * _f);
+      } {
+        const p = valueOf('s5');
+        line(0, 0, p.x, p.y);
+      }
+      // These three core Star glyphs (s1/s2/s5) already breathe via
+      // breatheFactor; bass rides on top of that same "scale" channel
+      // (radial pulse, 1.0–1.12 at full bass) and "fade" channel (extra glow),
+      // and overall level adds a touch more brightness on top. All three
+      // multipliers are 1 when idle/no audio, so this is a no-op until
+      // AUDIO_LEVELS messages start arriving.
+      noStroke(); {
+        const p = valueOf('s1');
+        const scl = breatheFactor('a7', t) * audioBassScale;
+        const col = [232, 201, 158, 220];
+        const fade = 1 * audioGlowBoost * audioBrightness;
+        renderAt('Star', p, R, {
+          scale: scl,
+          rot: atan2(p.y, p.x),
+          col,
+          fade
+        });
+      } {
+        const p = valueOf('s2');
+        const scl = breatheFactor('a10', t) * audioBassScale;
+        const col = [232, 201, 158, 220];
+        const fade = 1 * audioGlowBoost * audioBrightness;
+        renderAt('Star', p, R, {
+          scale: scl,
+          rot: atan2(p.y, p.x),
+          col,
+          fade
+        });
+      } {
+        const p = valueOf('s5');
+        const scl = breatheFactor('a11', t) * audioBassScale;
+        const col = [232, 201, 158, 220];
+        const fade = 1 * audioGlowBoost * audioBrightness;
+        renderAt('Star', p, R, {
+          scale: scl,
+          rot: atan2(p.y, p.x),
+          col,
+          fade
+        });
+      }
+    }
+  </script>
+</body>
+
+</html>
