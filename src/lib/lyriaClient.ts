@@ -22,8 +22,7 @@ export interface VersionPayload {
   provider: string;
   structure?: unknown;
   analysis?: Analysis;
-  // Pinned contract (server agent, lands at next server restart): optional user-supplied
-  // track name, echoed back on the generation payload once the server supports it.
+  // Optional user-supplied track name, echoed back on the generation payload.
   title?: string;
 }
 
@@ -39,10 +38,16 @@ export interface GenerationEntry {
   structure?: unknown;
   audioUrl: string;
   analysis?: Analysis;
-  // Pinned contract (server agent, lands at next server restart): optional user-supplied
-  // or renamed track title, and real audio duration once the server persists it.
+  // Optional user-supplied or renamed track title, and the measured audio duration.
   title?: string;
   durationSeconds?: number;
+  // The generation settings this entry was produced with, recorded on the manifest so HISTORY
+  // can restore them ("load with settings"). Manifests written before these fields existed
+  // carry none of them: treat undefined as "unknown" and leave the current setting alone —
+  // never substitute a default, which would silently lie about how the track was made.
+  language?: string;
+  durationTarget?: string;
+  batchCount?: number;
 }
 
 export interface GenerateOptions {
@@ -52,16 +57,18 @@ export interface GenerateOptions {
   durationTarget: string;
   model: 'pro' | 'clip';
   images: { name: string; url: string }[]; // object URLs from the tray
-  // Pinned contract: optional user-supplied track name, passed through to
-  // POST /api/lyria/generate's `title` field once the server supports it.
+  // Optional user-supplied track name, passed through to POST /api/lyria/generate's `title` field.
   title?: string;
+  // How many versions this one GENERATE click requested. Forwarded to the server so it lands on
+  // every manifest in the batch; omitted from the request body when the caller doesn't supply it,
+  // in which case the manifest simply carries no batchCount.
+  batchCount?: number;
 }
 
-// Project library — pinned contract shared with the server's server/projects.ts.
-// The /api/projects routes don't exist until the backend agent's work lands and the
-// server restarts, so every helper below fails soft: listProjects returns [] on any
-// failure (the app must boot serverless-route-less), the others throw and callers
-// (projectStore) swallow with console.warn — never an alert, never a crash.
+// Project library — shapes shared with server/projects.ts. Every helper below fails
+// soft: listProjects returns [] on any failure (the app must still boot if the routes
+// are unreachable), the others throw and callers (projectStore) swallow with
+// console.warn — never an alert, never a crash.
 export interface ProjectSettings {
   model: string;
   durationTarget: string;
@@ -176,6 +183,7 @@ export async function generateVersion(opts: GenerateOptions): Promise<VersionPay
       format: 'wav',
       images,
       ...(opts.title ? { title: opts.title } : {}),
+      ...(typeof opts.batchCount === 'number' ? { batchCount: opts.batchCount } : {}),
     }),
   });
   if (!response.ok) {
@@ -210,8 +218,7 @@ export async function getOpenRouterCredits(): Promise<{ totalCredits: number; to
   return response.json();
 }
 
-// Pinned contract (server agent, lands at next server restart): PUT /api/generations/:id
-// {title} -> {generation}. Renames a persisted generation's manifest title. Throws on any
+// PUT /api/generations/:id {title} -> {generation}. Renames a persisted generation's manifest title. Throws on any
 // non-OK response (404 unknown id, 400 empty title) — unlike listGenerations/listProjects,
 // callers here are direct user actions (row rename) that want to surface the failure,
 // not silently degrade.

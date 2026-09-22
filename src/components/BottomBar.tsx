@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Volume2, Square } from 'lucide-react';
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Square } from 'lucide-react';
 import { player } from '../lib/player';
 
 const METER_BARS = 15;
@@ -21,6 +21,9 @@ function levelToBars(level: number): number[] {
 export function BottomBar() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [volume, setVolume] = useState(75);
+  // Level to come back to when unmuting: the last audible level the user chose,
+  // whether they reached 0 via the mute button or by dragging the slider down.
+  const [preMuteVolume, setPreMuteVolume] = useState(75);
   const [meters, setMeters] = useState({ left: Array(METER_BARS).fill(0.2), right: Array(METER_BARS).fill(0.2) });
   const [time, setTime] = useState({ elapsed: 0, duration: 0 });
   const [activeVersion, setActiveVersion] = useState<{ n: number; format: string | null } | null>(null);
@@ -151,6 +154,8 @@ export function BottomBar() {
     };
   }, [isPlaying]);
 
+  const isMuted = volume === 0;
+
   return (
     <div className="h-16 shrink-0 border-t border-lyria-border flex items-center justify-center px-6 bg-[#0a0a0c] z-20">
      <div className="w-full max-w-[1600px] mx-auto flex items-center justify-between">
@@ -159,7 +164,7 @@ export function BottomBar() {
       <div className="flex items-center gap-4 w-[300px] text-[10px] font-mono text-lyria-text-muted">
         <span title="Playback position / total duration of the current version" className="text-lyria-text-main">{formatTime(time.elapsed, true)} <span className="text-lyria-text-muted">/ {formatTime(time.duration)}</span></span>
         <div className="w-px h-4 bg-lyria-border"></div>
-        <span title="Audio format and version number of the file currently loaded in the player">{activeVersion?.format ?? '—'}{activeVersion ? ` · V${activeVersion.n}` : ''}</span>
+        <span title="Audio format and version number of the file currently loaded in the player">{activeVersion?.format ?? '—'}{activeVersion && activeVersion.n > 0 ? ` · V${activeVersion.n}` : ''}</span>
       </div>
 
       {/* Center: Transport Controls */}
@@ -235,12 +240,25 @@ export function BottomBar() {
 
         <div className="flex items-center gap-3 group relative">
           <button
-            onClick={() => { const v = volume === 0 ? 75 : 0; setVolume(v); player.setVolume(v / 100); }}
-            title={volume === 0 ? 'Unmute' : 'Mute'}
-            aria-label={volume === 0 ? 'Unmute' : 'Mute'}
+            onClick={() => {
+              // Muting stores the current level so unmuting restores exactly it;
+              // preMuteVolume only ever holds an audible level, so unmuting can
+              // never land back on 0.
+              if (isMuted) {
+                setVolume(preMuteVolume);
+                player.setVolume(preMuteVolume / 100);
+              } else {
+                setPreMuteVolume(volume);
+                setVolume(0);
+                player.setVolume(0);
+              }
+            }}
+            title={isMuted ? `Unmute (restore volume to ${preMuteVolume}%)` : 'Mute'}
+            aria-label={isMuted ? 'Unmute' : 'Mute'}
+            aria-pressed={isMuted}
             className="text-lyria-text-muted hover:text-lyria-text-main transition-colors duration-150 cursor-pointer rounded lyria-focus-ring"
           >
-            <Volume2 size={16} />
+            {isMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
           </button>
           <div title="Playback volume (does not affect the exported file)" className="w-24 h-2 bg-[#1a1a1e] rounded-full relative overflow-hidden flex items-center">
             <div className="absolute left-0 top-0 bottom-0 bg-lyria-gold rounded-full pointer-events-none" style={{ width: `${volume}%` }}></div>
@@ -248,7 +266,14 @@ export function BottomBar() {
               type="range"
               min="0" max="100"
               value={volume}
-              onChange={(e) => { const v = parseInt(e.target.value); setVolume(v); player.setVolume(v / 100); }}
+              onChange={(e) => {
+                const v = parseInt(e.target.value);
+                setVolume(v);
+                // Dragging to an audible level also becomes the level to restore if the
+                // user later mutes (or drags all the way down and clicks unmute).
+                if (v > 0) setPreMuteVolume(v);
+                player.setVolume(v / 100);
+              }}
               title="Playback volume (does not affect the exported file)"
               aria-label="Playback volume"
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer lyria-focus-ring rounded-full"

@@ -2,10 +2,9 @@
 // closure-held private state, no React context). Owns the single "current project"
 // and keeps it persisted server-side via debounced PUTs.
 //
-// The /api/projects/* routes don't exist until the backend agent's work lands and the
-// dev server restarts. Every operation here is therefore best-effort and silent:
-// failures are console.warn'd and never thrown to callers, so the app keeps working
-// exactly as before (serverless-route-less) until that restart happens.
+// Every operation here is best-effort and silent: failures are console.warn'd and
+// never thrown to callers, so the app keeps working even if /api/projects/* is
+// unreachable.
 import {
   type Project,
   type ProjectSettings,
@@ -20,6 +19,9 @@ import {
 export type { ProjectPatch };
 
 const OLD_NAME_STORAGE_KEY = 'lyria_project_name';
+// Name for the project created on first run. Neutral on purpose: a fabricated
+// track-sounding name reads like the user already has work here when they don't.
+const DEFAULT_PROJECT_NAME = 'Untitled Project';
 const CURRENT_PROJECT_KEY = 'lyria_current_project_id';
 const FLUSH_DELAY_MS = 800;
 
@@ -139,9 +141,9 @@ export const projectStore = {
       if (projects.length === 0) {
         const migratedName = (() => {
           try {
-            return localStorage.getItem(OLD_NAME_STORAGE_KEY) || 'Nocturnal Drive';
+            return localStorage.getItem(OLD_NAME_STORAGE_KEY) || DEFAULT_PROJECT_NAME;
           } catch {
-            return 'Nocturnal Drive';
+            return DEFAULT_PROJECT_NAME;
           }
         })();
         try {

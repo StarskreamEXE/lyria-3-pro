@@ -26,9 +26,13 @@ backups/
 /*.png
 *.log
 
-# --- Local agent/editor tooling ---
+# --- Local editor / assistant tooling (never published) ---
 .serena/
-.claude/settings.local.json
+.claude/
+CLAUDE.md
+docs/plans/
+docs/BUILD_REPORT_*.md
+docs/screenshots/_raw-*
 .vscode/
 .idea/
 *.swp
@@ -38,3 +42,7 @@ backups/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Retired artifacts — local only
+deprecated/
+orchestration/

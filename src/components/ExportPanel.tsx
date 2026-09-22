@@ -1,44 +1,66 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { Download } from 'lucide-react';
 
-const FORMATS = ['WAV', 'MP3'];
+// Windows rejects \ / : * ? " < > | in file names, plus control characters, and it
+// silently trims trailing dots and spaces. Path separators are replaced (never kept)
+// so a title can't escape the download folder. Length is capped well below the 255-byte
+// name limit so the extension always survives.
+const MAX_NAME_LENGTH = 80;
 
-export function ExportPanel({ version = 1, model = 'LYRIA 3 PRO', audioUrl = null, fileFormat = null }: { version?: number; model?: string; audioUrl?: string | null; fileFormat?: string | null }) {
-  const [format, setFormat] = useState('WAV');
+export function sanitizeExportName(raw: string): string {
+  const cleaned = raw
+    .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '')
+    .slice(0, MAX_NAME_LENGTH);
+  // Re-trim: the slice above can leave a trailing space or dot behind.
+  return cleaned.replace(/[. ]+$/, '').trim();
+}
 
-  // Native WAV output is documented for Lyria 3 Pro only
-  const wavDisabled = model === 'LYRIA 3 CLIP';
+export function ExportPanel({
+  version = 1,
+  audioUrl = null,
+  fileFormat = null,
+  title = null,
+  versionId = null,
+}: {
+  version?: number;
+  // Kept on the prop type because CenterPanel still passes it; the panel no longer
+  // branches on the model, since export only ever downloads the server's own file.
+  model?: string;
+  audioUrl?: string | null;
+  fileFormat?: string | null;
+  // Optional track title and generation id, used to name the downloaded file.
+  title?: string | null;
+  versionId?: string | null;
+}) {
+  const hasAudio = Boolean(audioUrl);
 
-  // The export button never converts audio — it only downloads the file the server
-  // already generated. Prefer the version's own `format` field (carried on the payload)
-  // over parsing audioUrl, whose extension parse breaks on query strings; the URL path
-  // (query/hash stripped) is only a fallback for older entries without a format field.
-  const nativeExt = fileFormat
-    ? fileFormat.toUpperCase()
-    : audioUrl
-      ? (audioUrl.split(/[?#]/)[0].split('.').pop() || '').toUpperCase()
-      : null;
-  const nativeFormat = nativeExt === 'MP3' ? 'MP3' : 'WAV'; // default assumption before any audio exists
-
-  useEffect(() => {
-    if (audioUrl != null) {
-      // Only one chip is ever real once audio exists — keep selection in sync with it.
-      setFormat(nativeFormat);
-    } else if (wavDisabled && format === 'WAV') {
-      setFormat('MP3');
-    }
-  }, [wavDisabled, audioUrl, nativeFormat, format]);
+  // Export never converts: it downloads the exact file the server generated, so the
+  // format is reported, not chosen. Prefer the version's own `format` field (carried on
+  // the payload) over parsing audioUrl, whose extension parse breaks on query strings;
+  // the URL path (query/hash stripped) is only a fallback for older entries.
+  const nativeExt = (
+    fileFormat || (audioUrl ? audioUrl.split(/[?#]/)[0].split('.').pop() || '' : '')
+  ).toLowerCase();
+  const nativeFormat = nativeExt ? nativeExt.toUpperCase() : null;
 
   const handleExport = () => {
-    if (!audioUrl) { alert('This version has no generated audio yet — generate first.'); return; }
+    if (!audioUrl) return; // button is disabled in this state; guard for keyboard/programmatic calls
     const a = document.createElement('a');
     a.href = audioUrl;
-    // Same precedence as nativeExt above: real format field first, then the
-    // query/hash-stripped URL path extension as a fallback.
-    const ext = (fileFormat || audioUrl.split(/[?#]/)[0].split('.').pop() || 'wav').toLowerCase();
-    a.download = `lyria-v${version}.${ext}`;
+    const ext = nativeExt || 'wav';
+    // Name the file after the track title when there is one, then the generation id,
+    // then the tab number — the extension always stays the server's real one.
+    const base = sanitizeExportName(title || '') || sanitizeExportName(versionId || '') || `lyria-v${version}`;
+    a.download = `${base}.${ext}`;
     document.body.appendChild(a); a.click(); a.remove();
   };
+
+  const exportTitle = hasAudio
+    ? "Downloads this version's audio file (the exact file the server generated)"
+    : 'Nothing to export yet — this version has no generated audio';
 
   return (
     <div className="shrink-0 bg-[#110e0c]/85 backdrop-blur-lg rounded-xl border border-[#2b2521] p-3 flex flex-col gap-2.5 shadow-[0_4px_20px_rgba(0,0,0,0.4),inset_0_1px_0_rgba(255,255,255,0.03)] relative overflow-hidden">
@@ -46,59 +68,40 @@ export function ExportPanel({ version = 1, model = 'LYRIA 3 PRO', audioUrl = nul
 
       <div className="flex items-center justify-between relative z-10">
         <span className="font-display text-[10px] text-lyria-text-muted uppercase tracking-widest font-medium">EXPORT</span>
-        <span title="Version number this export applies to" className="text-[9px] text-lyria-text-muted font-mono">V{version}</span>
+        {/* version 0 is the "no version loaded" sentinel — show a dash, never "V0". */}
+        <span title="Version number this export applies to" className="text-[9px] text-lyria-text-muted font-mono">{version > 0 ? `V${version}` : '—'}</span>
       </div>
 
-      {/* Format */}
-      <div className="grid grid-cols-2 gap-1.5 relative z-10">
-        {FORMATS.map((f) => {
-          // WAV is disabled for CLIP versions (product rule); whichever chip doesn't
-          // match the server's actual file is also disabled, since export never
-          // converts — it only downloads what the server generated.
-          const wrongNativeFormat = audioUrl != null && f !== nativeFormat;
-          const disabled = (f === 'WAV' && wavDisabled) || wrongNativeFormat;
-          const title = f === 'WAV' && wavDisabled
-            ? 'Native WAV requires Lyria 3 Pro — this version was generated as Clip'
-            : wrongNativeFormat
-              ? `Unavailable — the server generated this version as ${nativeFormat}, and export never converts formats`
-              : `Selects ${f} as the export format`;
-          return (
-            <button
-              key={f}
-              onClick={() => { if (!disabled) setFormat(f); }}
-              disabled={disabled}
-              title={title}
-              aria-label={`${f} export format${disabled ? ' (unavailable)' : format === f ? ' (selected)' : ''}`}
-              aria-pressed={format === f}
-              className={`h-7 rounded-lg border text-[9px] font-medium tracking-widest transition-colors duration-150 lyria-focus-ring ${
-                disabled
-                  ? 'border-[#2b2521] bg-[#14110f] text-lyria-text-muted cursor-not-allowed'
-                  : format === f
-                    ? 'border-lyria-gold/60 bg-lyria-gold/10 text-lyria-gold shadow-[0_0_10px_rgba(214,180,133,0.15)] cursor-pointer active:scale-95'
-                    : 'border-[#2b2521] bg-[#14110f] text-lyria-text-muted hover:text-lyria-text-main hover:border-[#38302b] cursor-pointer active:scale-95'
-              }`}
-            >
-              {f}
-            </button>
-          );
-        })}
-      </div>
-      {audioUrl != null && (
-        <span title="The actual file format the server generated — export downloads this exact file" className="text-[8px] text-lyria-text-muted font-mono -mt-1.5 relative z-10">
-          server file is {nativeFormat}
+      {/* Format — reported, not selectable: only the server's native file can be downloaded. */}
+      <div
+        title={hasAudio
+          ? 'The actual file format the server generated — export downloads this exact file, it never converts'
+          : 'The format is known once this version has generated audio'}
+        className="flex items-center justify-between h-7 px-2.5 rounded-lg border border-[#2b2521] bg-[#14110f] relative z-10"
+      >
+        <span className="text-[9px] tracking-widest text-lyria-text-muted uppercase">FORMAT</span>
+        <span className={`text-[9px] font-mono tracking-widest ${hasAudio ? 'text-lyria-gold' : 'text-lyria-text-muted'}`}>
+          {hasAudio ? `${nativeFormat} (server native)` : 'NO AUDIO YET'}
         </span>
-      )}
+      </div>
 
       {/* Export action */}
       <button
         onClick={handleExport}
-        title="Downloads this version's audio file (the exact file the server generated)"
-        aria-label={`Export version ${version} as ${format}`}
-        className="h-9 rounded-lg border border-lyria-gold/40 bg-gradient-to-b from-lyria-gold/10 to-transparent flex items-center justify-center gap-2 hover:border-lyria-gold/60 transition-colors duration-150 active:scale-[0.98] relative z-10 cursor-pointer lyria-focus-ring"
+        disabled={!hasAudio}
+        title={exportTitle}
+        aria-label={hasAudio
+          ? `Export version ${version} as ${nativeFormat}`
+          : `Export version ${version} (unavailable — no generated audio)`}
+        className={`h-9 rounded-lg border flex items-center justify-center gap-2 transition-colors duration-150 relative z-10 lyria-focus-ring ${
+          hasAudio
+            ? 'border-lyria-gold/40 bg-gradient-to-b from-lyria-gold/10 to-transparent hover:border-lyria-gold/60 active:scale-[0.98] cursor-pointer'
+            : 'border-[#2b2521] bg-[#14110f] opacity-60 cursor-not-allowed'
+        }`}
       >
-        <Download size={12} className="text-lyria-gold" />
-        <span className="text-[10px] tracking-[0.2em] font-medium text-lyria-gold uppercase">
-          EXPORT {format}
+        <Download size={12} className={hasAudio ? 'text-lyria-gold' : 'text-lyria-text-muted'} />
+        <span className={`text-[10px] tracking-[0.2em] font-medium uppercase ${hasAudio ? 'text-lyria-gold' : 'text-lyria-text-muted'}`}>
+          {hasAudio ? `EXPORT ${nativeFormat}` : 'EXPORT'}
         </span>
       </button>
     </div>

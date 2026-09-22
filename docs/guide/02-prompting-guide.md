@@ -4,7 +4,7 @@
 
 ## What a prompt can control
 
-Genre and blends · BPM / tempo language · key & scale · time signature · instrumentation · vocal range, character, texture (timbre), and delivery · lyric language (8 supported) · user-written lyrics · instrumental-only · approximate duration · section order · timestamped arrangement · mood, energy curve, dynamics · production style, stereo-width, arrangement density · image/PDF references.
+Genre and blends · BPM / tempo language · key & scale · time signature · instrumentation · vocal range, character, texture (timbre), and delivery · lyric language (8 supported) · user-written lyrics · instrumental-only · duration (a *target* only — see [Duration language](#duration-language)) · section order · timestamped arrangement · mood, energy curve, dynamics · production style, stereo-width, arrangement density · image/PDF references.
 
 ## The recommended prompt shape
 
@@ -43,6 +43,8 @@ Full-width guitars, heavy drums, stacked vocal harmonies.
 3. **Lyrics** — separated from instructions, under section tags (see below).
 4. **Structure** — section tags and/or timestamp directives.
 
+In the app, parts 1, 2 and 4 are all just text you type into the PROMPT box — the server adds nothing of its own except the duration sentence and the lyrics block ([04 — App Integration](04-app-integration.md#prompt-assembly)). Section-inspector actions and the CHANGE STYLE tool write their directives *into that same box*, where you can read, edit and undo them.
+
 ## Section tags
 
 `[Intro]` `[Verse 1]` `[Pre-Chorus]` `[Chorus]` `[Verse 2]` `[Bridge]` `[Breakdown]` `[Final Chorus]` `[Outro]` — custom labels also work when the musical role is described. The model adapts content to the section's role (choruses hook harder, bridges add harmonic contrast).
@@ -60,6 +62,19 @@ Assign musical events to timed segments — ideal for genre shifts and scoring t
 ```
 
 Timestamps **guide** the arrangement; they are not sample-exact guarantees.
+
+## Duration language
+
+There is no duration parameter, so length is prompt text like everything else — and the model treats it as a suggestion. It can miss the target in either direction, and a one-minute request coming back at over two minutes is well within normal behavior. Budget for that: measure the delivered file rather than assuming the requested length.
+
+The app states the target once, as strongly as prose can, inside `assembleLyriaPrompt` (`server/lyria.ts`):
+
+```text
+Total running time: 1:00. The track starts at 0:00 and must reach its final note at 1:00.
+Structure the arrangement to fill exactly that span: do not end early, and do not run past 1:00.
+```
+
+Naming a total running time and an explicit end timestamp adheres better than a vague "Target duration: approximately X." It improves adherence; it does not enforce anything, and no wording can. The Clip model ignores duration language entirely (fixed ~30 s), so the app omits the sentence for Clip.
 
 ## Vocal direction
 

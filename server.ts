@@ -7,7 +7,8 @@ import { generateLyria, listGenerations, LyriaValidationError, analyzeGeneration
 import type { AnalyzeGenerationCallAiArgs } from "./server/lyria";
 import { listProjects, createProject, updateProject, archiveProject, ProjectNotFoundError } from "./server/projects";
 
-dotenv.config();
+// .env.local (documented setup) wins over .env; real environment variables win over both.
+dotenv.config({ path: ['.env.local', '.env'], quiet: true });
 
 function getAiClient(clientKey?: string): GoogleGenAI {
   const key = clientKey || process.env.GEMINI_API_KEY;
@@ -452,7 +453,37 @@ CRITICAL: Output ONLY the enhanced prompt. Do not include any conversational fil
     return res.status(500).json({ error: err?.message || "Internal server error" });
   });
 
-  app.use('/generations', express.static(path.join(process.cwd(), 'generations')));
+  // Persisted generation audio. `fallthrough: false` keeps a miss inside this mount
+  // instead of leaking into the SPA fallback (which would answer an <audio> request
+  // with HTML), and the error handler below turns every failure into a clean response.
+  app.use('/generations', express.static(path.join(process.cwd(), 'generations'), { fallthrough: false }));
+
+  // Range/static error handler for /generations. Without it, serve-static forwards
+  // send()'s errors to Express' default handler, which prints a stack trace and an HTML
+  // error page — that is what produced "RangeNotSatisfiableError: Range Not Satisfiable"
+  // in the log when the browser seeks with a range whose start is at or past the end of
+  // the file (e.g. the open-ended `bytes=<size>-`). send() has already set the
+  // `Content-Range: bytes */<size>` that RFC 9110 requires on a 416, so all that is left
+  // is to answer with the bare status and no body.
+  app.use('/generations', (err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+    const status = typeof err?.status === 'number' ? err.status : 500;
+    if (status === 416) {
+      res.removeHeader('Content-Type');
+      res.setHeader('Content-Length', '0');
+      return res.status(416).end();
+    }
+    if (status === 404) {
+      return res.status(404).json({ error: "Generation not found" });
+    }
+    if (status === 405) {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+    console.error("Generation asset error:", err?.message || err);
+    return res.status(status >= 400 && status < 600 ? status : 500).json({ error: "Failed to serve generation asset" });
+  });
 
   // Serve static assets or use Vite dev server
   if (process.env.NODE_ENV !== "production") {

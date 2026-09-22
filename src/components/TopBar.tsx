@@ -22,8 +22,12 @@ function relativeTime(iso: string): string {
 }
 
 export function TopBar() {
-  const [projectName, setProjectName] = useState('Nocturnal Drive');
+  // No project name is known until the store actually loads one. Starting empty (rather
+  // than with a made-up default) means a slow or failed project fetch shows a neutral
+  // "Loading" label instead of presenting a project that does not exist.
+  const [projectName, setProjectName] = useState('');
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const hasProject = currentId !== null;
   const [isEditingProject, setIsEditingProject] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isDocsOpen, setIsDocsOpen] = useState(false);
@@ -125,17 +129,21 @@ export function TopBar() {
         <div className="flex items-center gap-1.5 relative z-10">
           <div
             role="button"
-            tabIndex={isEditingProject ? -1 : 0}
-            className="flex flex-col cursor-pointer rounded lyria-focus-ring"
-            onClick={() => setIsEditingProject(true)}
+            tabIndex={isEditingProject || !hasProject ? -1 : 0}
+            className={`flex flex-col rounded lyria-focus-ring ${hasProject ? 'cursor-pointer' : 'cursor-default'}`}
+            onClick={() => hasProject && setIsEditingProject(true)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
+              if (hasProject && (e.key === 'Enter' || e.key === ' ')) {
                 e.preventDefault();
                 setIsEditingProject(true);
               }
             }}
-            aria-label={isEditingProject ? undefined : `Rename project, currently "${projectName}"`}
-            title={isEditingProject ? undefined : "Click to rename this project"}
+            aria-label={
+              isEditingProject ? undefined
+                : hasProject ? `Rename project, currently "${projectName}"`
+                : 'Loading project'
+            }
+            title={isEditingProject || !hasProject ? undefined : "Click to rename this project"}
           >
             <span className="font-display text-[9px] text-[#8b837c] uppercase tracking-widest mb-0.5 group-hover:text-lyria-text-muted transition-colors">PROJECT</span>
             {isEditingProject ? (
@@ -149,8 +157,12 @@ export function TopBar() {
                 className="text-sm text-lyria-text-main font-medium drop-shadow-[0_0_10px_rgba(255,255,255,0.1)] bg-transparent border-b border-lyria-gold focus:outline-none w-28"
                 autoFocus
               />
-            ) : (
+            ) : hasProject ? (
               <span className="text-sm text-lyria-text-main font-medium drop-shadow-[0_0_10px_rgba(255,255,255,0.1)] group-hover:text-white transition-colors truncate max-w-[150px]">{projectName}</span>
+            ) : (
+              // Nothing has loaded yet (or the fetch failed and the store is retrying):
+              // show a neutral placeholder label, never a fabricated project name.
+              <span className="text-sm text-lyria-text-muted font-medium truncate max-w-[150px]">Loading...</span>
             )}
           </div>
           <button

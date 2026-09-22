@@ -4,12 +4,11 @@ import { generateVersion, getOpenRouterCredits, type Project } from '../lib/lyri
 import { projectStore } from '../lib/projectStore';
 
 // Real per-track prices shown in the MODEL dropdown — mirrors costPerUnit's mapping
-// below (Pro covers LYRIA 3 PRO and LYRIA 2, since lyria-002 wiring is still TBD and
-// billed as pro; Clip is its own cheaper per-clip rate).
+// below. Only the two models this app really generates with are listed: Pro
+// ($0.08/song) and Clip (its own cheaper per-clip rate).
 const MODEL_OPTIONS: { name: string; priceLabel: string }[] = [
   { name: "LYRIA 3 PRO", priceLabel: "$0.08/song" },
   { name: "LYRIA 3 CLIP", priceLabel: "$0.04/clip" },
-  { name: "LYRIA 2", priceLabel: "$0.08 (routed as Pro)" },
 ];
 
 // ——— Lyrics section parsing (for the "Reorder sections" popover) ———
@@ -80,8 +79,12 @@ function rebuildLyricsFromSections(sections: LyricsSection[], separator: string)
 }
 
 export function SidebarLeft() {
-  const [prompt, setPrompt] = useState("Cinematic darkwave track with driving beats, deep synths, atmospheric pads, female vocals. Build from tension to release. 128bpm.");
-  const [lyrics, setLyrics] = useState("[Verse]\nCity lights don't sleep\nThey pull me underground\nHeartbeat in the streets\nLost but I'm not down\n\n[Pre-Chorus]\nWhispers in the dark\nCalling out my name\nI follow the spark\nStraight into the flame");
+  // Both editors start empty (placeholders only) — never a seeded demo
+  // prompt or demo lyrics, which would be shown as if the user wrote them and, worse,
+  // silently sent on a paid generation. A real project's values arrive via
+  // applyLoadedValues() when the project store loads.
+  const [prompt, setPrompt] = useState("");
+  const [lyrics, setLyrics] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   // Off by default: silently rewriting the prompt and burning a paid text-enhance
   // call before every generation must be an explicit opt-in, never a surprise.
@@ -117,15 +120,12 @@ export function SidebarLeft() {
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
-  // Undo / Redo stacks
-  const [promptHistory, setPromptHistory] = useState<string[]>([
-    "Cinematic darkwave track with driving beats, deep synths, atmospheric pads, female vocals. Build from tension to release. 128bpm."
-  ]);
+  // Undo / Redo stacks — seeded with the editors' (empty) initial value so index 0
+  // is always the current baseline.
+  const [promptHistory, setPromptHistory] = useState<string[]>([""]);
   const [promptHistoryIndex, setPromptHistoryIndex] = useState(0);
 
-  const [lyricsHistory, setLyricsHistory] = useState<string[]>([
-    "[Verse]\nCity lights don't sleep\nThey pull me underground\nHeartbeat in the streets\nLost but I'm not down\n\n[Pre-Chorus]\nWhispers in the dark\nCalling out my name\nI follow the spark\nStraight into the flame"
-  ]);
+  const [lyricsHistory, setLyricsHistory] = useState<string[]>([""]);
   const [lyricsHistoryIndex, setLyricsHistoryIndex] = useState(0);
 
   // File states — Lyria 3 accepts up to 10 image references; audio input is not supported
@@ -300,6 +300,10 @@ export function SidebarLeft() {
     isApplyingLoadRef.current = true;
 
     if (values.prompt !== undefined) {
+      // Discard (not commit) any in-flight typing burst: the loaded value replaces
+      // the editor wholesale and becomes the new baseline, so a pending keystroke
+      // commit landing afterwards would resurrect the previous project's text.
+      cancelPromptTyping();
       const loadedPrompt = values.prompt || '';
       promptRef.current = loadedPrompt;
       promptHistoryRef.current = [loadedPrompt];
@@ -310,6 +314,7 @@ export function SidebarLeft() {
     }
 
     if (values.lyrics !== undefined) {
+      cancelLyricsTyping();
       const loadedLyrics = values.lyrics || '';
       lyricsRef.current = loadedLyrics;
       lyricsHistoryRef.current = [loadedLyrics];
@@ -380,7 +385,9 @@ export function SidebarLeft() {
     return () => window.removeEventListener('lyria-load-params', handleLoadParams);
   }, []);
 
-  const handleGenerate = async () => {
+  // forceInstrumental lets a caller (the INSTRUMENTAL tool) take the vocals-off
+  // path for one generation without flipping the user's VOCALS toggle.
+  const handleGenerate = async (genOpts?: { forceInstrumental?: boolean }) => {
     if (isGeneratingRef.current) return;
     isGeneratingRef.current = true;
 
@@ -499,22 +506,22 @@ export function SidebarLeft() {
 
       // Vocals off = instrumental: suppress the lyrics block AND direct the model
       // in the request prompt (the visible prompt box is left untouched).
-      const instrumental = !vocalsEnabled;
+      const instrumental = genOpts?.forceInstrumental === true || !vocalsEnabled;
       const baseTitle = trackName.trim();
       const opts = {
         prompt: instrumental ? `${currentPrompt}\n\nInstrumental only — no vocals.` : currentPrompt,
         lyrics: instrumental ? '' : currentLyrics,
         language,
         durationTarget,
-        model: model === 'LYRIA 3 CLIP' ? 'clip' as const
-          : model === 'LYRIA 2' ? 'pro' as const // lyria-002 wiring TBD
-          : 'pro' as const,
+        model: model === 'LYRIA 3 CLIP' ? 'clip' as const : 'pro' as const,
         images: imageAssets,
+        // Persisted on the manifest so HISTORY's "load with settings" can restore
+        // the chips this take was made with, not just the prompt and model.
+        batchCount,
       };
 
       // Per-index title: batch of 1 sends the name as-is; batch >1 appends " (2)", " (3)"
       // etc. so a single click's multiple versions don't collide on the same track name.
-      // Silently degrades (server ignores `title` until it lands — see pinned contract).
       const results = await Promise.allSettled(
         Array.from({ length: batchCount }, (_, i) => generateVersion({
           ...opts,
@@ -581,8 +588,8 @@ export function SidebarLeft() {
   };
 
   // Real per-unit spend — mirrors the model mapping in handleGenerate's `opts.model`.
-  // Pro ($0.08/song) covers LYRIA 3 PRO and LYRIA 2 (lyria-002 wiring TBD, billed as pro);
-  // Clip ($0.04/clip) only for LYRIA 3 CLIP. Multiplied by batchCount for total spend.
+  // Pro ($0.08/song) for LYRIA 3 PRO; Clip ($0.04/clip) only for LYRIA 3 CLIP.
+  // Multiplied by batchCount for total spend.
   const costPerUnit = model === "LYRIA 3 CLIP" ? 0.04 : 0.08;
   const totalCost = costPerUnit * batchCount;
 
@@ -601,7 +608,10 @@ export function SidebarLeft() {
     const handleFocusLyrics = () => {
       setIsLyricsPinned(true);
     };
-    const handleRequestGenerate = () => { void handleGenerate(); };
+    const handleRequestGenerate = (e: Event) => {
+      const { instrumental } = (e as CustomEvent<{ instrumental?: boolean }>).detail ?? {};
+      void handleGenerate({ forceInstrumental: instrumental === true });
+    };
     window.addEventListener('lyria-prompt-append', handleAppend);
     window.addEventListener('lyria-focus-lyrics', handleFocusLyrics);
     window.addEventListener('lyria-request-generate', handleRequestGenerate);
@@ -643,11 +653,32 @@ export function SidebarLeft() {
   // every project switch).
   const isApplyingLoadRef = useRef(false);
 
+  // Typed text is undoable too. Keystrokes are coalesced into ONE undo step per
+  // burst: the pending value is held in a ref and only pushed onto the stack after
+  // TYPING_COMMIT_MS of idle, on blur, or right before any other history write
+  // (AI rewrite, CLEAR, appended directive, undo/redo). Without this, typing never
+  // entered the stack at all and a single undo after a wand rewrite jumped straight
+  // back to the initial snapshot, wiping everything the user had typed.
+  const TYPING_COMMIT_MS = 500;
+
+  const promptTypingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const promptTypingPendingRef = useRef<string | null>(null);
+  const lyricsTypingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lyricsTypingPendingRef = useRef<string | null>(null);
+
   // History helpers
-  const updatePromptWithHistory = (newVal: string) => {
-    // Read/write through refs: callers may hold a stale closure (bus handlers,
-    // the async auto-enhance branch in handleGenerate) — slicing the closure's
-    // promptHistory would silently drop just-committed undo entries.
+  const cancelPromptTyping = () => {
+    if (promptTypingTimerRef.current !== null) {
+      clearTimeout(promptTypingTimerRef.current);
+      promptTypingTimerRef.current = null;
+    }
+    promptTypingPendingRef.current = null;
+  };
+
+  // Raw stack push — read/write through refs: callers may hold a stale closure
+  // (bus handlers, the async auto-enhance branch in handleGenerate) — slicing the
+  // closure's promptHistory would silently drop just-committed undo entries.
+  const pushPromptHistory = (newVal: string) => {
     const updatedHistory = promptHistoryRef.current.slice(0, promptHistoryIndexRef.current + 1);
     updatedHistory.push(newVal);
     promptRef.current = newVal;
@@ -659,29 +690,70 @@ export function SidebarLeft() {
     if (!isApplyingLoadRef.current) projectStore.update({ prompt: newVal });
   };
 
+  // Lands the current typing burst as its own undo step (no-op when nothing is
+  // pending, or when the keystrokes ended back on the current entry — e.g. typed
+  // then deleted — which would otherwise cost an extra undo press to step past).
+  const commitPromptTyping = () => {
+    const pending = promptTypingPendingRef.current;
+    cancelPromptTyping();
+    if (pending === null) return;
+    if (pending === promptHistoryRef.current[promptHistoryIndexRef.current]) return;
+    pushPromptHistory(pending);
+  };
+
+  const queuePromptTyping = (value: string) => {
+    promptTypingPendingRef.current = value;
+    if (promptTypingTimerRef.current !== null) clearTimeout(promptTypingTimerRef.current);
+    promptTypingTimerRef.current = setTimeout(() => {
+      promptTypingTimerRef.current = null;
+      commitPromptTyping();
+    }, TYPING_COMMIT_MS);
+  };
+
+  const updatePromptWithHistory = (newVal: string) => {
+    // Flush first, so the pre-existing typed text is its own entry underneath this
+    // one: undo after an AI rewrite restores exactly what the user had typed, and
+    // redo returns the rewrite.
+    commitPromptTyping();
+    pushPromptHistory(newVal);
+  };
+
+  // Undo/redo walk the ref-held stack (not the render closure) because
+  // commitPromptTyping may have just pushed an entry in this same tick.
   const handlePromptUndo = () => {
-    if (promptHistoryIndex > 0) {
-      const prevIndex = promptHistoryIndex - 1;
-      setPromptHistoryIndex(prevIndex);
-      setPrompt(promptHistory[prevIndex]);
-      projectStore.update({ prompt: promptHistory[prevIndex] });
-    }
+    commitPromptTyping();
+    const prevIndex = promptHistoryIndexRef.current - 1;
+    if (prevIndex < 0) return;
+    const value = promptHistoryRef.current[prevIndex];
+    promptRef.current = value;
+    promptHistoryIndexRef.current = prevIndex;
+    setPromptHistoryIndex(prevIndex);
+    setPrompt(value);
+    projectStore.update({ prompt: value });
   };
 
   const handlePromptRedo = () => {
-    if (promptHistoryIndex < promptHistory.length - 1) {
-      const nextIndex = promptHistoryIndex + 1;
-      setPromptHistoryIndex(nextIndex);
-      setPrompt(promptHistory[nextIndex]);
-      projectStore.update({ prompt: promptHistory[nextIndex] });
-    }
+    commitPromptTyping();
+    const nextIndex = promptHistoryIndexRef.current + 1;
+    if (nextIndex > promptHistoryRef.current.length - 1) return;
+    const value = promptHistoryRef.current[nextIndex];
+    promptRef.current = value;
+    promptHistoryIndexRef.current = nextIndex;
+    setPromptHistoryIndex(nextIndex);
+    setPrompt(value);
+    projectStore.update({ prompt: value });
   };
 
-  const updateLyricsWithHistory = (newVal: string) => {
-    // Read/write through refs (exact mirror of updatePromptWithHistory): the
-    // auto-lyrics branch in handleGenerate calls this after awaits — slicing
-    // the render closure's lyricsHistory would silently drop any undo entries
-    // committed during the round-trip.
+  // Lyrics twins of the four helpers above — same coalescing and same ref rules.
+  const cancelLyricsTyping = () => {
+    if (lyricsTypingTimerRef.current !== null) {
+      clearTimeout(lyricsTypingTimerRef.current);
+      lyricsTypingTimerRef.current = null;
+    }
+    lyricsTypingPendingRef.current = null;
+  };
+
+  const pushLyricsHistory = (newVal: string) => {
     const updatedHistory = lyricsHistoryRef.current.slice(0, lyricsHistoryIndexRef.current + 1);
     updatedHistory.push(newVal);
     lyricsRef.current = newVal;
@@ -693,23 +765,57 @@ export function SidebarLeft() {
     if (!isApplyingLoadRef.current) projectStore.update({ lyrics: newVal });
   };
 
+  const commitLyricsTyping = () => {
+    const pending = lyricsTypingPendingRef.current;
+    cancelLyricsTyping();
+    if (pending === null) return;
+    if (pending === lyricsHistoryRef.current[lyricsHistoryIndexRef.current]) return;
+    pushLyricsHistory(pending);
+  };
+
+  const queueLyricsTyping = (value: string) => {
+    lyricsTypingPendingRef.current = value;
+    if (lyricsTypingTimerRef.current !== null) clearTimeout(lyricsTypingTimerRef.current);
+    lyricsTypingTimerRef.current = setTimeout(() => {
+      lyricsTypingTimerRef.current = null;
+      commitLyricsTyping();
+    }, TYPING_COMMIT_MS);
+  };
+
+  const updateLyricsWithHistory = (newVal: string) => {
+    commitLyricsTyping();
+    pushLyricsHistory(newVal);
+  };
+
   const handleLyricsUndo = () => {
-    if (lyricsHistoryIndex > 0) {
-      const prevIndex = lyricsHistoryIndex - 1;
-      setLyricsHistoryIndex(prevIndex);
-      setLyrics(lyricsHistory[prevIndex]);
-      projectStore.update({ lyrics: lyricsHistory[prevIndex] });
-    }
+    commitLyricsTyping();
+    const prevIndex = lyricsHistoryIndexRef.current - 1;
+    if (prevIndex < 0) return;
+    const value = lyricsHistoryRef.current[prevIndex];
+    lyricsRef.current = value;
+    lyricsHistoryIndexRef.current = prevIndex;
+    setLyricsHistoryIndex(prevIndex);
+    setLyrics(value);
+    projectStore.update({ lyrics: value });
   };
 
   const handleLyricsRedo = () => {
-    if (lyricsHistoryIndex < lyricsHistory.length - 1) {
-      const nextIndex = lyricsHistoryIndex + 1;
-      setLyricsHistoryIndex(nextIndex);
-      setLyrics(lyricsHistory[nextIndex]);
-      projectStore.update({ lyrics: lyricsHistory[nextIndex] });
-    }
+    commitLyricsTyping();
+    const nextIndex = lyricsHistoryIndexRef.current + 1;
+    if (nextIndex > lyricsHistoryRef.current.length - 1) return;
+    const value = lyricsHistoryRef.current[nextIndex];
+    lyricsRef.current = value;
+    lyricsHistoryIndexRef.current = nextIndex;
+    setLyricsHistoryIndex(nextIndex);
+    setLyrics(value);
+    projectStore.update({ lyrics: value });
   };
+
+  // Unmount: drop any pending typing timer so it can't fire a setState afterwards.
+  useEffect(() => () => {
+    cancelPromptTyping();
+    cancelLyricsTyping();
+  }, []);
 
   // ——— Reorder lyrics sections (the ArrowUpDown button in the lyrics footer) ———
   // Re-parsed every render so the popover always reflects the live textarea.
@@ -833,12 +939,12 @@ export function SidebarLeft() {
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        const errMsg = errData.error || "AI refinement request failed.";
-        if (typeof errMsg === 'string' && (errMsg.includes('Lightning dunning') || errMsg.includes('leaked'))) {
-          alert('API Key Error: ' + errMsg + '\n\nPlease click the Settings button INSIDE THIS APP (the gear icon) to add your own custom Gemini API Key.');
-        } else {
-          alert('Refinement failed: ' + errMsg);
-        }
+        const errMsg = typeof errData.error === 'string' && errData.error
+          ? errData.error
+          : 'AI refinement request failed.';
+        // Do NOT alert here: the catch below is the single error surface for this
+        // call, so a server-side failure shows exactly one dialog (it used to show
+        // this one AND the generic one from the catch, stacked).
         throw new Error(errMsg);
       }
 
@@ -862,8 +968,17 @@ export function SidebarLeft() {
         setIsLyricsWandOpen(false);
       }
     } catch (err) {
-      console.error(err);
-      alert('AI Modification failed. Please verify your connection or click the Settings button inside this app to set a custom GEMINI_API_KEY.');
+      // One alert per failure, carrying the real reason — never swallowed, never
+      // stacked. The console keeps the full error for debugging.
+      console.error('AI refinement failed:', err);
+      const errMsg = err instanceof Error && err.message
+        ? err.message
+        : 'AI refinement request failed.';
+      if (errMsg.includes('Lightning dunning') || errMsg.includes('leaked')) {
+        alert('API Key Error: ' + errMsg + '\n\nPlease click the Settings button INSIDE THIS APP (the gear icon) to add your own custom Gemini API Key.');
+      } else {
+        alert('Refinement failed: ' + errMsg + '\n\nCheck your connection, or click the Settings button inside this app to set your own API key.');
+      }
     } finally {
       loadingRef.current = false;
       if (isPromptType) {
@@ -998,10 +1113,15 @@ export function SidebarLeft() {
               placeholder="Describe the music..."
               value={prompt}
               onChange={(e) => {
-                setPrompt(e.target.value);
-                // Simple state keeping without filling undo history on every keystroke
-                if (!isApplyingLoadRef.current) projectStore.update({ prompt: e.target.value });
+                const next = e.target.value;
+                setPrompt(next);
+                promptRef.current = next;
+                // One undo step per typing burst, not one per keystroke (see
+                // queuePromptTyping); the store still tracks every keystroke.
+                queuePromptTyping(next);
+                if (!isApplyingLoadRef.current) projectStore.update({ prompt: next });
               }}
+              onBlur={commitPromptTyping}
             />
           </div>
 
@@ -1154,9 +1274,14 @@ export function SidebarLeft() {
                className="w-full h-full bg-transparent text-sm font-sans leading-[1.8] text-[#c0c0c8] resize-none outline-none placeholder-[#443e38] pr-12 overflow-y-auto"
                value={lyrics}
                onChange={(e) => {
-                 setLyrics(e.target.value);
-                 if (!isApplyingLoadRef.current) projectStore.update({ lyrics: e.target.value });
+                 const next = e.target.value;
+                 setLyrics(next);
+                 lyricsRef.current = next;
+                 // Same one-step-per-burst coalescing as the prompt editor.
+                 queueLyricsTyping(next);
+                 if (!isApplyingLoadRef.current) projectStore.update({ lyrics: next });
                }}
+               onBlur={commitLyricsTyping}
                placeholder="Write your lyrics here..."
              />
           </div>
@@ -1360,8 +1485,8 @@ export function SidebarLeft() {
         )}
       </div>
 
-      {/* Track name — optional, sent as `title` on the generate request (pinned contract;
-          server ignores it silently until it lands). Component state only: not part of
+      {/* Track name — optional, sent as `title` on the generate request.
+          Component state only: not part of
           undo/redo, not persisted to the project store. Batch >1 appends " (2)", " (3)". */}
       <input
         type="text"
@@ -1374,7 +1499,7 @@ export function SidebarLeft() {
       />
 
       {/* Generate Button */}
-      <button onClick={handleGenerate} title={`Generates ×${batchCount} version${batchCount > 1 ? 's' : ''} — total cost shown below`} className="w-full h-12 shrink-0 rounded-xl border border-lyria-gold/40 bg-gradient-to-b from-lyria-gold/10 to-transparent flex items-center justify-center gap-3 group relative overflow-hidden transition-all duration-150 hover:border-lyria-gold/60 active:scale-[0.98] cursor-pointer lyria-focus-ring lyria-breathe-glow">
+      <button onClick={() => { void handleGenerate(); }} title={`Generates ×${batchCount} version${batchCount > 1 ? 's' : ''} — total cost shown below`} className="w-full h-12 shrink-0 rounded-xl border border-lyria-gold/40 bg-gradient-to-b from-lyria-gold/10 to-transparent flex items-center justify-center gap-3 group relative overflow-hidden transition-all duration-150 hover:border-lyria-gold/60 active:scale-[0.98] cursor-pointer lyria-focus-ring lyria-breathe-glow">
         <div className={`absolute inset-0 bg-lyria-gold transition-opacity duration-300 ${isGenerating ? 'opacity-10' : 'opacity-0 group-hover:opacity-5'}`}></div>
         {/* Glow effect */}
         <div className="absolute left-4 w-10 h-10 bg-lyria-gold/20 blur-xl rounded-full"></div>
@@ -1438,7 +1563,7 @@ export function SidebarLeft() {
             </div>
           )}
         </div>
-        <button onClick={cycleDuration} title={model === "LYRIA 3 CLIP" ? "Lyria 3 Clip is fixed at 0:30" : "Target duration — written into the prompt"} aria-disabled={model === "LYRIA 3 CLIP"} className={`h-8 shrink-0 bg-[#110e0c]/80 backdrop-blur-md rounded-lg border border-[#2b2521] px-2 shadow-[0_2px_10px_rgba(0,0,0,0.3),inset_0_1px_0_rgba(255,255,255,0.02)] flex items-center gap-1.5 transition-colors duration-150 lyria-focus-ring ${model === "LYRIA 3 CLIP" ? 'opacity-50 cursor-not-allowed' : 'hover:bg-[#1a1715] active:scale-95 cursor-pointer'}`}>
+        <button onClick={cycleDuration} title={model === "LYRIA 3 CLIP" ? "Lyria 3 Clip is fixed at 0:30" : "Approximate target duration — written into the prompt. The model treats it as a hint and the returned track may be noticeably longer or shorter."} aria-disabled={model === "LYRIA 3 CLIP"} className={`h-8 shrink-0 bg-[#110e0c]/80 backdrop-blur-md rounded-lg border border-[#2b2521] px-2 shadow-[0_2px_10px_rgba(0,0,0,0.3),inset_0_1px_0_rgba(255,255,255,0.02)] flex items-center gap-1.5 transition-colors duration-150 lyria-focus-ring ${model === "LYRIA 3 CLIP" ? 'opacity-50 cursor-not-allowed' : 'hover:bg-[#1a1715] active:scale-95 cursor-pointer'}`}>
            <span className="text-[8px] text-lyria-text-muted uppercase tracking-widest">DUR</span>
            <span className="text-[10px] font-mono text-lyria-text-main">{model === "LYRIA 3 CLIP" ? "0:30" : durationTarget}</span>
         </button>

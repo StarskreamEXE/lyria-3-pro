@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Key, Save, Trash2 } from 'lucide-react';
 import { getOpenRouterCredits } from '../lib/lyriaClient';
@@ -20,21 +20,37 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
   const [saved, setSaved] = useState(false);
   const [serverStatus, setServerStatus] = useState<ServerKeyStatus | null>(null);
   const [openRouterBalance, setOpenRouterBalance] = useState<number | null>(null);
+  // What is actually persisted in localStorage right now, so the status lines can tell
+  // "saved" apart from "typed but not saved yet". Never rendered, only compared.
+  const [persistedApiKey, setPersistedApiKey] = useState('');
+  const [persistedOpenRouterApiKey, setPersistedOpenRouterApiKey] = useState('');
+  // Set as soon as the user picks a provider, so a late /api/settings/status response
+  // can never overwrite an explicit choice with the server default.
+  const providerChosenRef = useRef(false);
 
   useEffect(() => {
     if (isOpen) {
-      const stored = localStorage.getItem('gemini_api_key');
-      setApiKey(stored || '');
-      const storedOpenRouter = localStorage.getItem('openrouter_api_key');
-      setOpenRouterApiKey(storedOpenRouter || '');
+      const stored = localStorage.getItem('gemini_api_key') || '';
+      setApiKey(stored);
+      setPersistedApiKey(stored);
+      const storedOpenRouter = localStorage.getItem('openrouter_api_key') || '';
+      setOpenRouterApiKey(storedOpenRouter);
+      setPersistedOpenRouterApiKey(storedOpenRouter);
       const storedProvider = localStorage.getItem('ai_provider');
-      setAiProvider(storedProvider === 'openrouter' ? 'openrouter' : 'gemini');
+      const hasStoredProvider = storedProvider === 'openrouter' || storedProvider === 'gemini';
+      providerChosenRef.current = hasStoredProvider;
+      if (hasStoredProvider) setAiProvider(storedProvider as 'gemini' | 'openrouter');
       setSaved(false);
       setOpenRouterBalance(null);
       fetch('/api/settings/status')
         .then(r => (r.ok ? r.json() : null))
         .then((status: ServerKeyStatus | null) => {
           setServerStatus(status);
+          // No stored choice yet: follow the server's own default instead of showing
+          // GEMINI regardless of how the server is configured.
+          if (!providerChosenRef.current && status && (status.defaultProvider === 'openrouter' || status.defaultProvider === 'gemini')) {
+            setAiProvider(status.defaultProvider);
+          }
           const hasKey = Boolean(storedOpenRouter) || Boolean(status?.openRouterServerKey);
           if (hasKey) {
             getOpenRouterCredits()
@@ -49,10 +65,25 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
     }
   }, [isOpen]);
 
+  const chooseProvider = (provider: 'gemini' | 'openrouter') => {
+    providerChosenRef.current = true;
+    setAiProvider(provider);
+  };
+
   const handleSave = () => {
-    localStorage.setItem('gemini_api_key', apiKey.trim());
-    localStorage.setItem('openrouter_api_key', openRouterApiKey.trim());
+    const trimmedApiKey = apiKey.trim();
+    const trimmedOpenRouterApiKey = openRouterApiKey.trim();
+    localStorage.setItem('gemini_api_key', trimmedApiKey);
+    localStorage.setItem('openrouter_api_key', trimmedOpenRouterApiKey);
     localStorage.setItem('ai_provider', aiProvider);
+    setApiKey(trimmedApiKey);
+    setOpenRouterApiKey(trimmedOpenRouterApiKey);
+    setPersistedApiKey(trimmedApiKey);
+    setPersistedOpenRouterApiKey(trimmedOpenRouterApiKey);
+    providerChosenRef.current = true;
+    // 'storage' only reaches other tabs; tell this one too, so readouts that name
+    // the active provider update without waiting for an unrelated re-render.
+    window.dispatchEvent(new CustomEvent('lyria-provider-change', { detail: { provider: aiProvider } }));
     setSaved(true);
     setTimeout(() => {
       onClose();
@@ -61,11 +92,13 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
 
   const clearGeminiKey = () => {
     setApiKey('');
+    setPersistedApiKey('');
     localStorage.removeItem('gemini_api_key');
   };
 
   const clearOpenRouterKey = () => {
     setOpenRouterApiKey('');
+    setPersistedOpenRouterApiKey('');
     localStorage.removeItem('openrouter_api_key');
   };
 
@@ -99,7 +132,7 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
             </p>
             <div className="flex gap-2">
               <button
-                onClick={() => setAiProvider('gemini')}
+                onClick={() => chooseProvider('gemini')}
                 title="Which service handles AI assistance and music generation"
                 aria-label="Use Gemini as the AI provider"
                 aria-pressed={aiProvider === 'gemini'}
@@ -112,7 +145,7 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
                 GEMINI
               </button>
               <button
-                onClick={() => setAiProvider('openrouter')}
+                onClick={() => chooseProvider('openrouter')}
                 title="Which service handles AI assistance and music generation"
                 aria-label="Use OpenRouter as the AI provider"
                 aria-pressed={aiProvider === 'openrouter'}
@@ -132,7 +165,8 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
               <Key size={16} /> GEMINI API KEY
             </h3>
             <KeyStatusLine
-              browserKey={apiKey}
+              browserKeySaved={Boolean(persistedApiKey)}
+              unsavedEdit={apiKey.trim() !== persistedApiKey}
               serverConfigured={serverStatus ? serverStatus.geminiServerKey : null}
             />
             <div className="flex gap-2">
@@ -163,7 +197,8 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
               <Key size={16} /> OPENROUTER API KEY
             </h3>
             <KeyStatusLine
-              browserKey={openRouterApiKey}
+              browserKeySaved={Boolean(persistedOpenRouterApiKey)}
+              unsavedEdit={openRouterApiKey.trim() !== persistedOpenRouterApiKey}
               serverConfigured={serverStatus ? serverStatus.openRouterServerKey : null}
             />
             {openRouterBalance !== null && (
@@ -214,17 +249,32 @@ export function SettingsModal({ isOpen, onClose }: { isOpen: boolean, onClose: (
   );
 }
 
-function KeyStatusLine({ browserKey, serverConfigured }: { browserKey: string; serverConfigured: boolean | null }) {
-  const browserPart = browserKey
-    ? `Browser: saved (••••${browserKey.slice(-4)}) — overrides server`
-    : 'Browser: none';
+// Reports only what is actually persisted in this browser plus the server's boolean
+// status. A key that has merely been typed into the field is reported as unsaved, never
+// as saved, and no key material (not even a suffix) is ever rendered.
+function KeyStatusLine({
+  browserKeySaved,
+  unsavedEdit,
+  serverConfigured,
+}: {
+  browserKeySaved: boolean;
+  unsavedEdit: boolean;
+  serverConfigured: boolean | null;
+}) {
+  const browserPart = browserKeySaved ? 'Browser: saved — overrides server' : 'Browser: none';
   const serverPart =
-    serverConfigured === null ? 'Server: unknown' : serverConfigured ? 'Server: configured ✓' : 'Server: not configured';
+    serverConfigured === null ? 'Server: unknown' : serverConfigured ? 'Server: configured' : 'Server: not configured';
   return (
     <p title="Which key will actually be used: a browser-saved key always overrides the server's .env.local key" className="text-[11px] leading-relaxed mb-2">
-      <span className={browserKey ? 'text-lyria-gold' : 'text-lyria-text-muted'}>{browserPart}</span>
+      <span className={browserKeySaved ? 'text-lyria-gold' : 'text-lyria-text-muted'}>{browserPart}</span>
       <span className="text-lyria-text-muted"> · </span>
       <span className={serverConfigured ? 'text-lyria-gold' : 'text-lyria-text-muted'}>{serverPart}</span>
+      {unsavedEdit && (
+        <>
+          <span className="text-lyria-text-muted"> · </span>
+          <span className="text-lyria-signal">Unsaved change — press Save Settings</span>
+        </>
+      )}
     </p>
   );
 }

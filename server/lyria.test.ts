@@ -15,7 +15,7 @@ import type { Analysis } from './lyria';
 import { embedWavInfo } from './lyria';
 import { embedId3 } from './lyria';
 import { detectAudioFormat } from './lyria';
-import { wavDurationSeconds } from './lyria';
+import { wavDurationSeconds, mp3DurationSeconds, computeDurationSeconds } from './lyria';
 import { renameGeneration, GenerationNotFoundError } from './lyria';
 import { assertSafeId, InvalidIdError, MissingKeyError, writeJsonAtomic } from './lyria';
 import { mockModifyText, mockEnhancePrompt, buildMockAnalysis } from './lyria';
@@ -32,7 +32,7 @@ describe('assembleLyriaPrompt', () => {
       durationTarget: '3:00',
     });
     expect(result).toContain('Cinematic darkwave track. 128bpm.');
-    expect(result).toContain('Target duration: approximately 3:00.');
+    expect(result).toContain('Total running time: 3:00.');
     expect(result).toContain('Lyrics (sing in EN):');
     expect(result).toContain('[Verse]\nCity lights');
   });
@@ -56,13 +56,62 @@ describe('assembleLyriaPrompt', () => {
       durationTarget: '3:00',
       model: 'clip',
     });
-    expect(result).not.toContain('Target duration');
+    expect(result).not.toContain('Total running time');
+    expect(result).not.toContain('3:00');
   });
 
   it('throws on empty prompt', () => {
     expect(() =>
       assembleLyriaPrompt({ prompt: ' ', lyrics: '', language: 'EN', durationTarget: '3:00' }),
     ).toThrow();
+  });
+
+  // ITEM 5: the old wording ("Target duration: approximately X.") was too weak — a 1:00 target
+  // came back as a 2:19 track on OpenRouter Pro. The instruction must now name the total running
+  // time AND the end timestamp, unambiguously, and say it exactly once.
+  it('states the duration as an explicit total running time plus an end timestamp', () => {
+    const result = assembleLyriaPrompt({
+      prompt: 'Synthwave',
+      lyrics: '',
+      language: 'EN',
+      durationTarget: '1:00',
+    });
+    expect(result).toContain('Total running time: 1:00.');
+    expect(result).toContain('starts at 0:00');
+    expect(result).toContain('final note at 1:00');
+    expect(result).toMatch(/do not end early/i);
+    expect(result).toMatch(/do not run past 1:00/i);
+  });
+
+  it('does not hedge the duration with "approximately"', () => {
+    const result = assembleLyriaPrompt({
+      prompt: 'Synthwave',
+      lyrics: '',
+      language: 'EN',
+      durationTarget: '2:30',
+    });
+    expect(result).not.toMatch(/approximately/i);
+  });
+
+  it('states the duration instruction exactly once (one block, one running-time sentence)', () => {
+    const result = assembleLyriaPrompt({
+      prompt: 'Synthwave',
+      lyrics: '[Verse] hello',
+      language: 'EN',
+      durationTarget: '2:30',
+    });
+    expect(result.match(/Total running time:/g)).toHaveLength(1);
+  });
+
+  it('omits the duration block entirely when no durationTarget is given', () => {
+    const result = assembleLyriaPrompt({
+      prompt: 'Synthwave',
+      lyrics: '',
+      language: 'EN',
+      durationTarget: '',
+    });
+    expect(result).not.toContain('Total running time');
+    expect(result).toBe('Synthwave');
   });
 });
 
@@ -670,6 +719,190 @@ describe('wavDurationSeconds', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// ITEM 24: real MP3 duration parsing. OpenRouter returns MP3 for Pro as well as Clip, and those
+// files previously got no durationSeconds at all, so HISTORY showed nothing. Fixtures below are
+// synthesized byte-for-byte here (no dependencies, no real audio needed) so the frame arithmetic
+// is asserted against known-exact values.
+// ---------------------------------------------------------------------------
+
+const MPEG1_L3_44100_SAMPLES_PER_FRAME = 1152;
+const MPEG1_L3_44100_RATE = 44100;
+
+/**
+ * Builds one MPEG-1 Layer III frame header: no CRC, 44100 Hz, joint stereo.
+ * bitrateIndex 9 = 128 kbps, 14 = 320 kbps (the rate OpenRouter's Lyria output opens with).
+ */
+function mpeg1Layer3Header(bitrateIndex: number, padding = 0): Buffer {
+  return Buffer.from([
+    0xff,
+    0xfb, // sync + MPEG-1 + Layer III + no protection
+    (bitrateIndex << 4) | (0 << 2) | (padding << 1), // bitrate | 44100 | padding | private
+    0x40, // joint stereo, no emphasis
+  ]);
+}
+
+/** Frame size in bytes for an MPEG-1 Layer III 44100 Hz frame at the given kbps. */
+function mpeg1Layer3FrameLength(kbps: number, padding = 0): number {
+  return Math.floor((144 * kbps * 1000) / MPEG1_L3_44100_RATE) + padding;
+}
+
+/** Concatenates `frameCount` CBR MPEG-1 Layer III frames (zero-filled payloads) at `kbps`. */
+function makeCbrMp3(frameCount: number, kbps = 128, bitrateIndex = 9): Buffer {
+  const length = mpeg1Layer3FrameLength(kbps);
+  const frames: Buffer[] = [];
+  for (let i = 0; i < frameCount; i++) {
+    const frame = Buffer.alloc(length);
+    mpeg1Layer3Header(bitrateIndex).copy(frame, 0);
+    frames.push(frame);
+  }
+  return Buffer.concat(frames);
+}
+
+/**
+ * Builds a VBR-style MP3: a leading Xing header frame declaring `declaredFrames`, followed by
+ * only `realFrames` actual frames. The declared count deliberately disagrees with what a frame
+ * walk would find, so the test proves the Xing count is what gets used.
+ */
+function makeXingMp3(declaredFrames: number, realFrames: number, tag: 'Xing' | 'Info' = 'Xing'): Buffer {
+  const length = mpeg1Layer3FrameLength(128);
+  const header = Buffer.alloc(length);
+  mpeg1Layer3Header(9).copy(header, 0);
+  header.write(tag, 36, 'latin1'); // MPEG-1 non-mono: Xing sits 36 bytes into the frame
+  header.writeUInt32BE(0x01, 40); // flags: frames field present
+  header.writeUInt32BE(declaredFrames, 44);
+  return Buffer.concat([header, makeCbrMp3(realFrames)]);
+}
+
+/** Wraps mp3 bytes in a minimal (frameless, padded) ID3v2.3 tag of `payloadSize` bytes. */
+function withId3Tag(mp3: Buffer, payloadSize = 2048): Buffer {
+  const header = Buffer.alloc(10);
+  header.write('ID3', 0, 'ascii');
+  header[3] = 3; // v2.3
+  header[6] = (payloadSize >>> 21) & 0x7f;
+  header[7] = (payloadSize >>> 14) & 0x7f;
+  header[8] = (payloadSize >>> 7) & 0x7f;
+  header[9] = payloadSize & 0x7f;
+  return Buffer.concat([header, Buffer.alloc(payloadSize), mp3]);
+}
+
+const cbrSeconds = (frames: number) =>
+  Math.round(((frames * MPEG1_L3_44100_SAMPLES_PER_FRAME) / MPEG1_L3_44100_RATE) * 10) / 10;
+
+describe('mp3DurationSeconds', () => {
+  it('walks CBR frames and returns the exact duration', () => {
+    const frames = 383; // 383 * 1152 / 44100 = 10.005... -> 10.0
+    expect(mp3DurationSeconds(makeCbrMp3(frames))).toBe(cbrSeconds(frames));
+    expect(mp3DurationSeconds(makeCbrMp3(frames))).toBe(10.0);
+  });
+
+  it('skips a leading ID3v2 tag before looking for the first frame', () => {
+    const frames = 383;
+    expect(mp3DurationSeconds(withId3Tag(makeCbrMp3(frames)))).toBe(10.0);
+  });
+
+  it('handles 320 kbps CBR (the bitrate real OpenRouter Lyria output opens with)', () => {
+    const length = mpeg1Layer3FrameLength(320);
+    expect(length).toBe(1044);
+    const frames = 1178; // the real 30s clip length on disk
+    const mp3 = Buffer.concat(
+      Array.from({ length: frames }, () => {
+        const frame = Buffer.alloc(length);
+        mpeg1Layer3Header(14).copy(frame, 0);
+        return frame;
+      }),
+    );
+    expect(mp3DurationSeconds(mp3)).toBe(30.8);
+  });
+
+  it('VBR: uses the Xing frame count instead of walking frames', () => {
+    // 1000 declared frames, but only 5 real ones follow — a frame walk would report ~0.2s.
+    const mp3 = makeXingMp3(1000, 5);
+    expect(mp3DurationSeconds(mp3)).toBe(cbrSeconds(1001)); // Xing frame + the declared count's own frame
+    expect(mp3DurationSeconds(mp3)).toBe(26.1);
+  });
+
+  it('VBR: accepts an "Info" (CBR-written LAME) header the same way as "Xing"', () => {
+    expect(mp3DurationSeconds(makeXingMp3(1000, 5, 'Info'))).toBe(26.1);
+  });
+
+  it('VBR: falls back to a frame walk when the Xing header has no frames flag', () => {
+    const mp3 = makeXingMp3(1000, 5);
+    mp3.writeUInt32BE(0x00, 40); // clear the flags field: no usable frame count
+    expect(mp3DurationSeconds(mp3)).toBe(cbrSeconds(6)); // 1 header frame + 5 real frames
+  });
+
+  it('handles VBR streams whose frames change bitrate mid-file (no Xing header)', () => {
+    const mixed = Buffer.concat([makeCbrMp3(100, 128, 9), makeCbrMp3(100, 320, 14)]);
+    // Bitrate changes the frame SIZE, not the sample count: 200 frames either way.
+    expect(mp3DurationSeconds(mixed)).toBe(cbrSeconds(200));
+  });
+
+  it('stops cleanly at a trailing ID3v1 tag rather than counting it as audio', () => {
+    const frames = 383;
+    const id3v1 = Buffer.alloc(128);
+    id3v1.write('TAG', 0, 'ascii');
+    expect(mp3DurationSeconds(Buffer.concat([makeCbrMp3(frames), id3v1]))).toBe(10.0);
+  });
+
+  it('returns null for garbage bytes (never guesses a duration)', () => {
+    expect(mp3DurationSeconds(Buffer.from('this is not an mp3 at all, not even close'))).toBeNull();
+  });
+
+  it('returns null for an empty buffer', () => {
+    expect(mp3DurationSeconds(Buffer.alloc(0))).toBeNull();
+  });
+
+  it('returns null for WAV bytes mislabeled as mp3 (the legacy .mp3-holding-RIFF files)', () => {
+    expect(mp3DurationSeconds(makeMockWav(1))).toBeNull();
+  });
+
+  it('returns null for an ID3 tag with no audio frames after it', () => {
+    expect(mp3DurationSeconds(withId3Tag(Buffer.alloc(0), 64))).toBeNull();
+  });
+
+  it('returns null for a frame header using the reserved/free bitrate index', () => {
+    const frame = Buffer.alloc(mpeg1Layer3FrameLength(128));
+    mpeg1Layer3Header(0).copy(frame, 0); // bitrate index 0 = "free format", unsupported
+    expect(mp3DurationSeconds(frame)).toBeNull();
+  });
+
+  it('rounds to 1 decimal place, matching wavDurationSeconds', () => {
+    const seconds = mp3DurationSeconds(makeCbrMp3(500))!;
+    expect(seconds).toBe(13.1); // 500 * 1152 / 44100 = 13.061...
+    expect(Number(seconds.toFixed(1))).toBe(seconds);
+  });
+});
+
+// The fresh-generation duration path. Covered directly because the LYRIA_MOCK generator only ever
+// emits wav bytes, so the mp3 branch cannot be reached through generateLyria without paying for a
+// real provider call.
+describe('computeDurationSeconds (fresh-generation duration)', () => {
+  it('parses a real duration out of freshly generated mp3 bytes (pro model)', () => {
+    expect(computeDurationSeconds('mp3', 'google/lyria-3-pro-preview', makeCbrMp3(383))).toBe(10.0);
+  });
+
+  it('parses a real duration out of freshly generated wav bytes', () => {
+    expect(computeDurationSeconds('wav', 'lyria-3-pro-preview', makeMockWav(3))).toBe(3.0);
+  });
+
+  it('prefers the parsed mp3 duration over the clip constant', () => {
+    expect(computeDurationSeconds('mp3', 'lyria-3-clip-preview', makeCbrMp3(383))).toBe(10.0);
+  });
+
+  it('falls back to the clip constant only when clip mp3 bytes will not parse', () => {
+    expect(computeDurationSeconds('mp3', 'lyria-3-clip-preview', Buffer.from('junk'))).toBe(30);
+  });
+
+  it('leaves a pro mp3 undefined when its bytes will not parse (never guesses)', () => {
+    expect(computeDurationSeconds('mp3', 'google/lyria-3-pro-preview', Buffer.from('junk'))).toBeUndefined();
+  });
+
+  it('leaves an unparseable wav undefined', () => {
+    expect(computeDurationSeconds('wav', 'lyria-3-pro-preview', Buffer.from('junk'))).toBeUndefined();
+  });
+});
+
 describe('embedId3', () => {
   const readId3Frame = (mp3: Buffer, frameId: string): string | undefined => {
     if (mp3.toString('ascii', 0, 3) !== 'ID3') return undefined;
@@ -879,6 +1112,166 @@ describe('generateLyria (mock mode) — title, durationSeconds, embedded tags', 
   });
 });
 
+// ---------------------------------------------------------------------------
+// ITEM 19: manifests never stored the generation settings, so History's "load with settings"
+// had nothing to restore. language / durationTarget / batchCount are now persisted verbatim —
+// and only when the request actually supplied them, so a manifest never invents a setting.
+// ---------------------------------------------------------------------------
+
+describe('generateLyria (mock mode) — persisted generation settings', () => {
+  const GEN_DIR = path.join(process.cwd(), 'generations');
+  const prevMock = process.env.LYRIA_MOCK;
+  let createdId: string | undefined;
+
+  const readManifest = async (id: string): Promise<GenerationManifest> =>
+    JSON.parse(await fs.readFile(path.join(GEN_DIR, `${id}.json`), 'utf8')) as GenerationManifest;
+
+  beforeEach(() => {
+    process.env.LYRIA_MOCK = '1';
+  });
+
+  afterEach(async () => {
+    process.env.LYRIA_MOCK = prevMock;
+    if (createdId) {
+      await fs.rm(path.join(GEN_DIR, `${createdId}.wav`), { force: true });
+      await fs.rm(path.join(GEN_DIR, `${createdId}.mp3`), { force: true });
+      await fs.rm(path.join(GEN_DIR, `${createdId}.json`), { force: true });
+      createdId = undefined;
+    }
+  });
+
+  it('persists language, durationTarget and batchCount onto the manifest', async () => {
+    const result = await generateLyria(null, {
+      prompt: 'Settings round-trip track',
+      language: 'JA',
+      durationTarget: '1:30',
+      batchCount: 3,
+    });
+    createdId = result.id;
+
+    const manifest = await readManifest(result.id);
+    expect(manifest.language).toBe('JA');
+    expect(manifest.durationTarget).toBe('1:30');
+    expect(manifest.batchCount).toBe(3);
+  });
+
+  it('trims whitespace around language and durationTarget', async () => {
+    const result = await generateLyria(null, {
+      prompt: 'Whitespace settings track',
+      language: '  ES  ',
+      durationTarget: '  2:00 ',
+    });
+    createdId = result.id;
+
+    const manifest = await readManifest(result.id);
+    expect(manifest.language).toBe('ES');
+    expect(manifest.durationTarget).toBe('2:00');
+  });
+
+  it('omits the fields entirely when the request supplies none (never defaults them)', async () => {
+    const result = await generateLyria(null, { prompt: 'No settings track' });
+    createdId = result.id;
+
+    const manifest = await readManifest(result.id);
+    expect(manifest.language).toBeUndefined();
+    expect(manifest.durationTarget).toBeUndefined();
+    expect(manifest.batchCount).toBeUndefined();
+    expect('language' in manifest).toBe(false);
+    expect('durationTarget' in manifest).toBe(false);
+    expect('batchCount' in manifest).toBe(false);
+  });
+
+  it('omits blank/whitespace-only settings rather than storing empty strings', async () => {
+    const result = await generateLyria(null, {
+      prompt: 'Blank settings track',
+      language: '   ',
+      durationTarget: '',
+    });
+    createdId = result.id;
+
+    const manifest = await readManifest(result.id);
+    expect(manifest.language).toBeUndefined();
+    expect(manifest.durationTarget).toBeUndefined();
+  });
+
+  it('rejects a non-positive or non-numeric batchCount instead of storing it', async () => {
+    const result = await generateLyria(null, {
+      prompt: 'Bad batch track',
+      batchCount: 0,
+    });
+    createdId = result.id;
+    expect((await readManifest(result.id)).batchCount).toBeUndefined();
+
+    const negative = await generateLyria(null, { prompt: 'Negative batch track', batchCount: -2 });
+    await fs.rm(path.join(GEN_DIR, `${negative.id}.wav`), { force: true });
+    await fs.rm(path.join(GEN_DIR, `${negative.id}.json`), { force: true });
+    expect(negative.id).not.toBe(result.id);
+
+    const bogus = await generateLyria(null, {
+      prompt: 'Bogus batch track',
+      batchCount: 'three' as unknown as number,
+    });
+    const bogusManifest = await readManifest(bogus.id);
+    await fs.rm(path.join(GEN_DIR, `${bogus.id}.wav`), { force: true });
+    await fs.rm(path.join(GEN_DIR, `${bogus.id}.json`), { force: true });
+    expect(bogusManifest.batchCount).toBeUndefined();
+  });
+});
+
+describe('listGenerations — manifests predating the settings fields', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lyria-settings-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('keeps working and reports the settings as undefined (never invents values)', async () => {
+    const legacy: GenerationManifest = {
+      id: 'gen-legacy-settings',
+      model: 'lyria-3-pro-preview',
+      format: 'wav',
+      provider: 'openrouter',
+      prompt: 'legacy prompt',
+      lyrics: 'legacy lyrics',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      durationSeconds: 12,
+    };
+    await fs.writeFile(path.join(tmpDir, `${legacy.id}.json`), JSON.stringify(legacy), 'utf8');
+
+    const [entry] = await listGenerations(tmpDir);
+    expect(entry.id).toBe('gen-legacy-settings');
+    expect(entry.language).toBeUndefined();
+    expect(entry.durationTarget).toBeUndefined();
+    expect(entry.batchCount).toBeUndefined();
+  });
+
+  it('passes the settings through untouched when a manifest does carry them', async () => {
+    const modern: GenerationManifest = {
+      id: 'gen-modern-settings',
+      model: 'google/lyria-3-pro-preview',
+      format: 'mp3',
+      provider: 'openrouter',
+      prompt: 'modern prompt',
+      lyrics: 'modern lyrics',
+      generatedAt: '2026-02-01T00:00:00.000Z',
+      durationSeconds: 60,
+      language: 'FR',
+      durationTarget: '1:00',
+      batchCount: 2,
+    };
+    await fs.writeFile(path.join(tmpDir, `${modern.id}.json`), JSON.stringify(modern), 'utf8');
+
+    const [entry] = await listGenerations(tmpDir);
+    expect(entry.language).toBe('FR');
+    expect(entry.durationTarget).toBe('1:00');
+    expect(entry.batchCount).toBe(2);
+  });
+});
+
 describe('renameGeneration', () => {
   let tmpDir: string;
 
@@ -1059,6 +1452,80 @@ describe('listGenerations — durationSeconds backfill', () => {
 
     const result = await listGenerations(tmpDir);
     expect(result[0].durationSeconds).toBeUndefined();
+  });
+
+  // ITEM 24: every OpenRouter Pro generation on disk is an mp3, and the old backfill only knew
+  // how to parse wav — so those rows showed no duration at all. The backfill now parses the real
+  // MPEG frame stream, and only falls back to the clip constant for bytes it cannot parse.
+  it('backfills a REAL parsed duration for a pro/mp3 manifest (not undefined, not a constant)', async () => {
+    const manifest: GenerationManifest = {
+      id: 'gen-backfill-real-mp3',
+      model: 'google/lyria-3-pro-preview',
+      format: 'mp3',
+      provider: 'openrouter',
+      prompt: 'p',
+      lyrics: 'l',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.json`), JSON.stringify(manifest), 'utf8');
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.mp3`), withId3Tag(makeCbrMp3(383)));
+
+    const result = await listGenerations(tmpDir);
+    expect(result[0].durationSeconds).toBe(10.0);
+
+    const persisted = JSON.parse(await fs.readFile(path.join(tmpDir, `${manifest.id}.json`), 'utf8'));
+    expect(persisted.durationSeconds).toBe(10.0);
+  });
+
+  it('prefers the parsed mp3 duration over the clip constant for a clip manifest', async () => {
+    const manifest: GenerationManifest = {
+      id: 'gen-backfill-clip-real',
+      model: 'lyria-3-clip-preview',
+      format: 'mp3',
+      provider: 'openrouter',
+      prompt: 'p',
+      lyrics: 'l',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.json`), JSON.stringify(manifest), 'utf8');
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.mp3`), makeCbrMp3(383));
+
+    const result = await listGenerations(tmpDir);
+    expect(result[0].durationSeconds).toBe(10.0); // parsed, NOT the 30s clip constant
+  });
+
+  it('leaves durationSeconds undefined for an unparseable pro/mp3 file (never guesses)', async () => {
+    const manifest: GenerationManifest = {
+      id: 'gen-backfill-bad-mp3',
+      model: 'google/lyria-3-pro-preview',
+      format: 'mp3',
+      provider: 'openrouter',
+      prompt: 'p',
+      lyrics: 'l',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.json`), JSON.stringify(manifest), 'utf8');
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.mp3`), Buffer.from('not actually mp3 bytes'));
+
+    const result = await listGenerations(tmpDir);
+    expect(result[0].durationSeconds).toBeUndefined();
+  });
+
+  it('trusts the BYTES over the manifest format claim (legacy RIFF stored as .mp3)', async () => {
+    const manifest: GenerationManifest = {
+      id: 'gen-backfill-riff-in-mp3',
+      model: 'google/lyria-3-pro-preview',
+      format: 'mp3',
+      provider: 'openrouter',
+      prompt: 'p',
+      lyrics: 'l',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.json`), JSON.stringify(manifest), 'utf8');
+    await fs.writeFile(path.join(tmpDir, `${manifest.id}.mp3`), makeMockWav(6)); // RIFF bytes, .mp3 name
+
+    const result = await listGenerations(tmpDir);
+    expect(result[0].durationSeconds).toBeCloseTo(6.0, 1);
   });
 });
 

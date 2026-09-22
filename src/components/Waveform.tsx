@@ -356,6 +356,9 @@ export const Waveform = memo(({
 
   const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (!isSeekable) return;
+    // Only a primary (left) press may seek or start a scrub. Right/middle presses
+    // must leave the playback position alone so the lane context menu can open.
+    if (e.button !== 0) return;
     isDraggingRef.current = true;
     (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
     seekToClientX(e.clientX);

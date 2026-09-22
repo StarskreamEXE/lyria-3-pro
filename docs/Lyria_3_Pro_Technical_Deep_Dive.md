@@ -2,7 +2,19 @@
 
 **Model ID:** `lyria-3-pro-preview`  
 **Status:** Preview  
-**Current as of:** July 15, 2026
+**Reference material current as of:** July 15, 2026
+
+---
+
+## Read this first
+
+This document is a technical reference for single-turn Lyria 3 generation. Most of it describes Google's documented contract. Three points below govern how you should write code against that contract, and they override any later passage that reads otherwise.
+
+1. **You do not choose the container; you detect it.** Google documents a WAV response path for Pro (`response_format: { type: "audio" }`) and MP3 for Clip; OpenRouter returns **MP3 for both Pro and Clip**. Output is stereo 44.1 kHz either way. Because the container you get depends on the provider and can differ from the container you asked for, never name a file after the request. `detectAudioFormat` in `server/lyria.ts` reads the magic bytes, and that detected format — not the request — drives the file extension, the manifest `format` field, the metadata embedder and the duration math. Treat every `format: "wav"` in the code samples below as a *request*, and name the file you write from the bytes you received. (`LYRIA_MOCK=1` synthesizes a local WAV and never reaches a provider; mock takes say nothing about provider behavior.)
+
+2. **Each provider has an entitlement precondition before any generation succeeds.** Google's free tier grants **zero Lyria requests per day**, so a free-tier key fails the generation request immediately with `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)`. That is an entitlement wall, not congestion — no amount of backoff clears it, and a retry wrapper must special-case it. Gemini generation therefore requires a **billing-enabled** Google API key. OpenRouter requires account credits and refuses any audio request while the balance is under **$0.50**, returning `402` before generating, so a refused request is not billed. Gemini request/response details below are Google's documented contract.
+
+3. **Duration is a prompt-side target, not a guarantee.** There is no duration parameter anywhere in the API. The requested length is written into the prompt text, and the model is free to miss it in either direction — a track can come back materially longer or shorter than asked. Timestamped structure improves adherence; nothing enforces it. Clip is fixed at roughly 30 seconds by the model and ignores the target entirely.
 
 ---
 
@@ -11,19 +23,19 @@
 | Property | Lyria 3 Pro |
 |---|---|
 | Primary purpose | Full-length, structured song generation |
-| API | Gemini Interactions API |
+| API | Gemini Interactions API; OpenRouter chat-completions is the alternative route |
 | JavaScript SDK | `@google/genai` 2.3.0+ |
 | Python SDK | `google-genai` 2.3.0+ |
-| Model ID | `lyria-3-pro-preview` |
+| Model ID | `lyria-3-pro-preview` (OpenRouter: `google/lyria-3-pro-preview`) |
 | Typical duration | Approximately a couple of minutes |
-| Duration control | Prompt- and timestamp-influenced, not sample-exact |
+| Duration control | Prompt- and timestamp-influenced only; no duration parameter, no guarantee — the returned length can miss the target in either direction |
 | Input modalities | Text and images |
 | Maximum images | Up to 10 |
 | Uploaded audio input | Not documented |
 | Output channels | Stereo |
 | Sample rate | 44.1 kHz |
-| Default format | MP3 |
-| Optional format | WAV through `response_format` |
+| Format on OpenRouter | MP3 for both Pro and Clip |
+| Format documented by Google | WAV for Pro through `response_format`; MP3 for Clip — detect it from the bytes regardless |
 | Vocals | Supported |
 | Custom lyrics | Supported |
 | Multilingual lyrics | Supported |
@@ -31,7 +43,7 @@
 | Song structure prompting | Supported |
 | Timestamp prompting | Supported |
 | Price | $0.08 per successful Pro request |
-| Free API tier | Not listed |
+| Free API tier | None — Google's free tier grants zero Lyria requests per day and answers with `429 ... limit: 0 requests per day on Free Tier`; OpenRouter needs credits (minimum $0.50 balance for audio) |
 | Generation workflow | Single-turn |
 | Watermarking | SynthID |
 | Native stems | Not documented |
@@ -78,7 +90,7 @@ A Lyria 3 Pro prompt can specify:
 - User-written lyrics
 - Lyrical subject
 - Instrumental-only output
-- Approximate song duration
+- A target song duration (prompt-side only — there is no duration parameter and no guarantee)
 - Section order
 - Timestamped arrangement instructions
 - Mood and atmosphere
@@ -140,7 +152,7 @@ Half-time drums, syncopated guitar chugs, and sub-bass impacts. No lead vocal.
 Larger final chorus followed by an abrupt final hit.
 ```
 
-Timestamps guide the arrangement but do not guarantee exact sample-level boundaries.
+Timestamps guide the arrangement; they do not bind it. This is not merely a sample-level imprecision — the total running time itself is only a target, and the API has no duration parameter to enforce it, so a track can come back considerably longer or shorter than requested. State the running time explicitly and lay out the sections, then measure what you actually received.
 
 ---
 
@@ -218,6 +230,8 @@ const result = await ai.interactions.create({
     [1:35 - 1:50] Breakdown
     [1:50 - 2:00] Final chorus and ending
   `,
+  // Google-documented WAV request path for Pro. It is a request, not a promise:
+  // the container you receive depends on the provider. Detect it from the bytes.
   response_format: {
     type: "audio",
   },
@@ -228,17 +242,26 @@ if (!result.output_audio?.data) {
   throw new Error("No audio returned.");
 }
 
-fs.writeFileSync(
-  "lyria-song.wav",
-  Buffer.from(result.output_audio.data, "base64"),
-);
+const audio = Buffer.from(result.output_audio.data, "base64");
+
+// Name the file after the bytes you received, never after the format you asked for.
+const isWav =
+  audio.length >= 12 &&
+  audio.toString("ascii", 0, 4) === "RIFF" &&
+  audio.toString("ascii", 8, 12) === "WAVE";
+
+fs.writeFileSync(`lyria-song.${isWav ? "wav" : "mp3"}`, audio);
 
 console.log(result.output_text);
 ```
 
+`server/lyria.ts` ships the full version of that check as `detectAudioFormat`, which also recognizes a bare MPEG frame sync and an `ID3` tag, and returns `"unknown"` rather than guessing.
+
 ---
 
 ## 8. Production TypeScript Generator
+
+The `format` option below is a **request**, not a result. Providers do not reliably honor it — OpenRouter returns MP3 for both Pro and Clip regardless of what was asked for — so the generator detects the container from the returned bytes and uses the detected value for the file extension and the manifest. This mirrors `detectAudioFormat` / `generateLyria` in `server/lyria.ts`.
 
 ```typescript
 import { GoogleGenAI } from "@google/genai";
@@ -259,6 +282,7 @@ interface GenerateLyriaOptions {
   prompt: string;
   outputDirectory: string;
   basename?: string;
+  /** Requested container only. The bytes decide what is actually written. */
   format?: OutputFormat;
   images?: ImageInput[];
   storeInteraction?: boolean;
@@ -270,6 +294,31 @@ interface ParsedLyriaResponse {
   textBlocks: string[];
   jsonBlocks: unknown[];
   rawTextBlocks: string[];
+}
+
+/**
+ * Detects the real container from magic bytes: RIFF/WAVE, an ID3v2 tag, or a bare
+ * MPEG frame sync. Returns "unknown" rather than guessing. Full version in
+ * server/lyria.ts.
+ */
+function detectAudioFormat(buf: Buffer): OutputFormat | "unknown" {
+  if (
+    buf.length >= 12 &&
+    buf.toString("ascii", 0, 4) === "RIFF" &&
+    buf.toString("ascii", 8, 12) === "WAVE"
+  ) {
+    return "wav";
+  }
+
+  if (buf.length >= 3 && buf.toString("ascii", 0, 3) === "ID3") {
+    return "mp3";
+  }
+
+  if (buf.length >= 2 && buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) {
+    return "mp3";
+  }
+
+  return "unknown";
 }
 
 function inferImageMimeType(filename: string): string {
@@ -442,6 +491,7 @@ export async function generateLyriaPro(
     store: storeInteraction,
   };
 
+  // Google-documented WAV request path (Pro only). A request, not a promise.
   if (format === "wav") {
     request.response_format = {
       type: "audio",
@@ -454,13 +504,20 @@ export async function generateLyriaPro(
 
   const result = parseInteraction(interaction);
 
+  // The requested `format` was only a hint. Trust the bytes; fall back to the
+  // request only when the container is unidentifiable.
+  const detectedFormat = detectAudioFormat(result.audio);
+
+  const actualFormat: OutputFormat =
+    detectedFormat === "unknown" ? format : detectedFormat;
+
   await fs.mkdir(outputDirectory, {
     recursive: true,
   });
 
   const audioPath = path.join(
     outputDirectory,
-    `${basename}.${format}`,
+    `${basename}.${actualFormat}`,
   );
 
   const textPath = path.join(
@@ -487,7 +544,8 @@ export async function generateLyriaPro(
       {
         model: MODEL_ID,
         interactionId: result.interactionId,
-        format,
+        format: actualFormat,
+        requestedFormat: format,
         prompt,
         images: images.map((image) => ({
           filename: path.basename(image.path),
@@ -557,7 +615,7 @@ await generateLyriaPro({
   prompt,
   outputDirectory: "./generations",
   basename: "industrial-metal-test-01",
-  format: "wav",
+  format: "wav", // requested only — OpenRouter returns MP3; the file is named from the bytes
   storeInteraction: false,
 });
 ```
@@ -592,7 +650,7 @@ await generateLyriaPro({
   ],
   outputDirectory: "./generations",
   basename: "visual-score-01",
-  format: "wav",
+  format: "wav", // requested only — OpenRouter returns MP3; the file is named from the bytes
 });
 ```
 
@@ -640,7 +698,7 @@ await generateLyriaPro({
   prompt: lyricsPrompt,
   outputDirectory: "./generations",
   basename: "custom-lyrics-01",
-  format: "wav",
+  format: "wav", // requested only — OpenRouter returns MP3; the file is named from the bytes
 });
 ```
 
@@ -655,6 +713,8 @@ pip install "google-genai>=2.3.0"
 ---
 
 ## 13. Production Python Generator
+
+As in §8, `output_format` is a **request**. The generator below detects the real container from the returned bytes and writes the file under the detected extension.
 
 ```python
 from __future__ import annotations
@@ -740,6 +800,20 @@ def encode_images(
         )
 
     return parts
+
+
+def detect_audio_format(data: bytes) -> str:
+    """Detects the real container from magic bytes; returns 'wav', 'mp3' or 'unknown'."""
+    if len(data) >= 12 and data[0:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav"
+
+    if data[0:3] == b"ID3":
+        return "mp3"
+
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return "mp3"
+
+    return "unknown"
 
 
 def try_parse_json(text: str) -> Any | None:
@@ -873,6 +947,7 @@ def generate_lyria_pro(
         "store": store_interaction,
     }
 
+    # Google-documented WAV request path (Pro only). A request, not a promise.
     if output_format == "wav":
         request["response_format"] = {
             "type": "audio",
@@ -881,6 +956,14 @@ def generate_lyria_pro(
     interaction = client.interactions.create(**request)
     result = parse_interaction(interaction)
 
+    # The request was only a hint. Trust the bytes; fall back to the request
+    # only when the container is unidentifiable.
+    detected_format = detect_audio_format(result.audio)
+
+    actual_format = (
+        output_format if detected_format == "unknown" else detected_format
+    )
+
     output_directory.mkdir(
         parents=True,
         exist_ok=True,
@@ -888,7 +971,7 @@ def generate_lyria_pro(
 
     audio_path = (
         output_directory /
-        f"{basename}.{output_format}"
+        f"{basename}.{actual_format}"
     )
 
     text_path = (
@@ -911,7 +994,8 @@ def generate_lyria_pro(
     manifest = {
         "model": MODEL_ID,
         "interaction_id": result.interaction_id,
-        "format": output_format,
+        "format": actual_format,
+        "requested_format": output_format,
         "prompt": prompt,
         "images": [
             {
@@ -969,7 +1053,7 @@ generate_lyria_pro(
     prompt=prompt,
     output_directory=Path("./generations"),
     basename="cinematic-electronic-01",
-    output_format="wav",
+    output_format="wav",  # requested only — OpenRouter returns MP3
     store_interaction=False,
 )
 ```
@@ -977,6 +1061,8 @@ generate_lyria_pro(
 ---
 
 ## 15. Raw REST Request
+
+Google's documented contract. This endpoint returns audio only for a billing-enabled key: a free-tier key answers `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)`, which is an entitlement wall rather than a transient limit. The `response_format` block below is Google's documented WAV request path — treat it as a request and detect the container from the returned bytes.
 
 ```bash
 curl -X POST \
@@ -1004,8 +1090,10 @@ jq -r '
   | .content[]
   | select(.type == "audio")
   | .data
-' response.json | base64 -d > song.wav
+' response.json | base64 -d > song.out
 ```
+
+Name the output after the bytes, not after the format you requested — check with `file song.out` (or the first four bytes) and rename to `.mp3` or `.wav` accordingly.
 
 ---
 
@@ -1127,7 +1215,7 @@ const result = await withRetry(() =>
     prompt,
     outputDirectory: "./generations",
     basename: "retry-test",
-    format: "wav",
+    format: "wav", // requested only — OpenRouter returns MP3
   }),
 );
 ```
@@ -1161,7 +1249,8 @@ Recommended stored manifest:
   "model": "lyria-3-pro-preview",
   "interaction_id": "{{ INTERACTION_ID }}",
   "prompt": "{{ ORIGINAL_PROMPT }}",
-  "format": "wav",
+  "format": "{{ DETECTED_FORMAT }}",
+  "requested_format": "{{ REQUESTED_FORMAT }}",
   "generated_at": "{{ ISO_TIMESTAMP }}",
   "audio_path": "{{ AUDIO_PATH }}",
   "lyrics": "{{ RETURNED_LYRICS }}",
@@ -1170,6 +1259,8 @@ Recommended stored manifest:
   "request_version": 1
 }
 ```
+
+`format` records what the bytes turned out to be (`mp3` on OpenRouter). Keep the requested value in a separate field if you want it at all; never let it stand in for the real container.
 
 ---
 
@@ -1181,13 +1272,21 @@ Recommended stored manifest:
 | `401` | Invalid authentication | Check API key |
 | `403` | Access or permission failure | Check project and model access |
 | `408` | Request timeout | Retry |
-| `429` | Rate limit or quota exhaustion | Retry with backoff |
+| `429` | Rate limit **or** quota/entitlement wall | Retry with backoff only if it is a real rate limit — see below |
 | `500` | Server failure | Retry |
 | `502` | Upstream failure | Retry |
 | `503` | Service unavailable | Retry |
 | `504` | Gateway timeout | Retry |
 
 Do not repeatedly retry malformed prompts, invalid image data, or permission failures.
+
+**Not every 429 is retryable.** Google's free tier answers Lyria generation with:
+
+```text
+429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)
+```
+
+A per-day limit of zero is an entitlement wall, not congestion. No amount of backoff clears it; the fix is a billing-enabled key, or a provider that will serve the model. The retry wrapper in §18 treats 429 as retryable by design, so inspect the message before handing a request to it and surface this case to the user as a configuration problem. Any Gemini generation attempt made with a free-tier key hits exactly this failure.
 
 ---
 
@@ -1208,7 +1307,8 @@ Lyria 3 Pro currently does not document native support for:
 - Follow-up editing
 - Conversation-based refinement
 - Continuous streaming
-- Sample-exact duration
+- Any duration guarantee at all — not merely sample-exact: there is no duration parameter, and the prompt-side target can be missed by a wide margin in either direction
+- A choice of output container — you receive whatever the provider encodes (MP3 for both models on OpenRouter)
 - Exact reproducibility
 - Guaranteed lyric adherence
 - Guaranteed structural timing
@@ -1284,8 +1384,9 @@ Layered octave doubles only in the final chorus.
   "prompt_version": 3,
   "prompt_hash": "{{ SHA256 }}",
   "interaction_id": "{{ INTERACTION_ID }}",
+  "detected_format": "{{ DETECTED_FORMAT }}",
   "request": {
-    "format": "wav",
+    "format": "{{ REQUESTED_FORMAT }}",
     "store": false,
     "images": []
   },
@@ -1327,6 +1428,16 @@ Layered octave doubles only in the final chorus.
 }
 ```
 
+`musical_target.duration_seconds` is exactly that — a target. Record the measured length separately, from the file.
+
+### What this app actually persists
+
+The shipped schema is `GenerationManifest` in `server/lyria.ts`, written to `generations/<id>.json`. Always present: `id`, `model`, `format` (detected from the bytes, never the request), `provider` (`gemini | openrouter | mock`), `prompt`, `lyrics`, `generatedAt`. Written only when they apply: `interactionId`, `structure`, `analysis`, `title`, `durationSeconds`, and the recorded request settings `language`, `durationTarget` and `batchCount`.
+
+- `language`, `durationTarget` and `batchCount` capture what the user asked for so the History pane can restore the settings later. They are written **only when the request supplied a usable value** — never defaulted — so manifests predating the fields simply lack them. Every consumer must treat all three as optional and absent, rather than substituting a default.
+- `durationSeconds` is a real measurement, parsed from the file itself: the RIFF `fmt`/`data` chunks for WAV, and the MPEG frame stream (Xing/Info or VBRI frame count, else a full frame walk) for MP3. Since OpenRouter output is MP3, the MP3 path is the one that runs most often. Bytes that will not parse leave the field undefined rather than being estimated; the only fallback is the Clip model's fixed 30 seconds. Older manifests are backfilled lazily on the next listing.
+- `analysis` is filled in only when the user explicitly runs analysis (`POST /api/ai/analyze`), which is an additional paid model call on top of generation. **Nothing analyses automatically after a generation.** The result is cached into the manifest, so a given generation is analyzed once unless the caller forces a refresh.
+
 ---
 
 ## 24. Official Documentation
@@ -1347,7 +1458,7 @@ Layered octave doubles only in the final chorus.
 
 ## 25. Summary
 
-Lyria 3 Pro is a single-turn, full-song music-generation model that accepts text and image input and produces stereo MP3 or WAV audio with vocals, lyrics, and multi-section arrangements.
+Lyria 3 Pro is a single-turn, full-song music-generation model that accepts text and image input and produces stereo 44.1 kHz audio with vocals, lyrics, and multi-section arrangements. On OpenRouter that audio arrives as **MP3** for both Pro and Clip; Google documents a WAV response path for Pro. Either way, detect the container from the returned bytes rather than assuming the one you requested. Generation requires an entitled key on whichever provider you choose: a billing-enabled Google key (the free tier grants zero Lyria requests per day), or an OpenRouter account with at least a $0.50 balance.
 
 Its strongest documented controls are:
 
@@ -1358,7 +1469,7 @@ Its strongest documented controls are:
 - Vocal direction
 - Instrumentation
 - BPM and key language
-- Approximate duration
+- A prompt-side duration target (best-effort, never binding)
 - Image-based creative context
 
 Its principal limitations are:
@@ -1368,5 +1479,6 @@ Its principal limitations are:
 - No native MIDI
 - No audio-reference conditioning
 - No deterministic seed
-- No exact duration guarantee
+- No duration guarantee of any kind, and no duration parameter
+- No control over the output container — detect it from the bytes
 - No continuous streaming

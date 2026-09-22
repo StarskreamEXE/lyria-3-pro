@@ -115,7 +115,7 @@ const CHAPTERS: Chapter[] = [
         <H>Quick start</H>
         <UL
           items={[
-            <>Open <Chip>SETTINGS</Chip> (the gear, top right) — pick a provider (Gemini or OpenRouter) and add an API key if the server doesn't have one.</>,
+            <>Open <Chip>SETTINGS</Chip> (the gear, top right) — pick a provider and add an API key if the server doesn't have one. Generation needs an entitled key either way: a billing-enabled Google key, or an OpenRouter account with credits.</>,
             <>Write a style prompt in the <Chip>PROMPT</Chip> box. Be technical: genre, BPM, key, vocal character (see Writing Prompts).</>,
             <>Optionally add lyrics in the <Chip>LYRICS</Chip> box under section tags like <Chip>[Verse 1]</Chip> and <Chip>[Chorus]</Chip>.</>,
             <>Pick your model and settings with the <Chip>MODEL</Chip>, <Chip>DUR</Chip> and <Chip>BATCH</Chip> chips next to the GENERATE button.</>,
@@ -140,13 +140,18 @@ const CHAPTERS: Chapter[] = [
           rows={[
             ['Purpose', 'Full structured songs', 'Fast 30-second clips, high volume'],
             ['Duration', 'Up to ~3 minutes (prompt-controlled)', 'Fixed ~30 seconds — ignores the DUR chip'],
-            ['Audio format', 'WAV', 'MP3'],
+            ['Audio format', 'Whatever the provider returns — MP3 on OpenRouter', 'Whatever the provider returns — MP3 on OpenRouter'],
             ['Price', '$0.08 per successful request', '$0.04 per clip'],
           ]}
         />
         <P>
           Both output stereo 44.1 kHz audio, and everything carries a SynthID watermark and C2PA metadata.
         </P>
+        <Note>
+          You do not choose the container. The app detects the format from the bytes the provider actually returned and
+          writes that file to disk — on OpenRouter, <strong>both</strong> Pro and Clip come back as MP3, while Google
+          documents a WAV response for Pro. Never assume the format; EXPORT serves whatever file was really written.
+        </Note>
         <H>What a Pro generation contains</H>
         <P>
           A single request returns a <strong>finished song</strong>, not an editable project: an
@@ -158,7 +163,7 @@ const CHAPTERS: Chapter[] = [
         <UL
           items={[
             <><strong>Clip</strong> for iterating on a style cheaply — audition ideas at half the price and a fraction of the wait.</>,
-            <><strong>Pro</strong> once the prompt is dialed in — full arrangement, full length, native WAV for export.</>,
+            <><strong>Pro</strong> once the prompt is dialed in — full arrangement, full length, and the provider's own file straight to EXPORT.</>,
           ]}
         />
       </>
@@ -369,11 +374,16 @@ rhythmic intensity.`}</CodeBlock>
         <SpecTable
           head={['Chip', 'What it does']}
           rows={[
-            ['MODEL', 'Picks Lyria 3 Pro or Clip — each has its own per-track price and output format.'],
-            ['DUR', 'Cycles the target duration (1:00 / 2:00 / 3:00). Sent as prompt-side duration language; Clip ignores it (fixed ~30s).'],
+            ['MODEL', 'Picks Lyria 3 Pro or Clip — each has its own per-track price.'],
+            ['DUR', 'Cycles the target duration (1:00 / 2:00 / 3:00). An approximate target only, written into the prompt; disabled for Clip, which is always ~30s.'],
             ['BATCH', 'Versions per generation. Each is a separate, full API call — cost scales linearly.'],
           ]}
         />
+        <Note>
+          <Chip>DUR</Chip> is a <strong>target the model may not match</strong>. Lyria 3 has no duration parameter, so
+          the figure is only prompt-side language, and a track can come back materially longer or shorter than asked.
+          Treat the length you receive — and the price — as fixed regardless of what you asked for.
+        </Note>
         <CostWarn>
           BATCH ×4 on Pro is 4 parallel requests = <strong>$0.32</strong>. Lyria 3 has no multi-sample parameter, so
           batching is always N full-price calls. The cost readout under GENERATE shows the real spend for your current
@@ -409,8 +419,15 @@ rhythmic intensity.`}</CodeBlock>
     body: (
       <>
         <P>
-          Every completed generation becomes a <strong>version tab</strong> (V1, V2, …) above the timeline. A version
-          is an immutable artifact — it is never edited, only superseded by a newer version.
+          A brand-new project has <strong>no version tabs at all</strong> — the timeline says so plainly instead of
+          showing empty placeholders. Your first generation becomes V1, and reopening the project does not renumber
+          anything. Every completed generation becomes a <strong>version tab</strong> (V1, V2, …) above the timeline. A
+          version is an immutable artifact — it is never edited, only superseded by a newer version.
+        </P>
+        <P>
+          Right-click a tab for <em>Load settings from this version</em>, <em>Rename…</em>, <em>Analyze</em> and{' '}
+          <em>Export</em>. Renaming happens inline in the tab itself — <Kbd>Enter</Kbd> saves, <Kbd>Esc</Kbd> cancels —
+          with no browser popup.
         </P>
         <H>Why "edit" means "regenerate"</H>
         <P>
@@ -418,8 +435,20 @@ rhythmic intensity.`}</CodeBlock>
           follow-up prompts, replacing a section in-place, or audio inpainting. So every edit action in this app is
           really <em>new prompt → new full generation → new version</em> — at full generation price.
         </P>
+        <H>Analysis — manual and paid</H>
+        <P>
+          The timeline's sections come from <Chip>ANALYZE</Chip>, which sends the generation's audio to a text model to
+          detect genre, mood, energy, BPM, key, instrumentation and timestamped section boundaries. It{' '}
+          <strong>never runs on its own</strong>: it happens only when you press ANALYZE in the center panel or pick
+          Analyze from a version tab, waveform or HISTORY right-click menu.
+        </P>
+        <CostWarn>
+          Analysis is a <strong>separate paid call</strong> on your selected provider. The result is cached in the
+          generation's manifest, so each generation only needs analyzing once. Until you analyze a version, its
+          timeline has no sections and the inspector has nothing to select.
+        </CostWarn>
         <H>The section inspector</H>
-        <P>Select a section on the timeline to open the inspector. Its actions append a timed directive to your prompt and queue a new generation:</P>
+        <P>Select a detected section on the timeline to open the inspector. Its actions append a timed directive to your prompt — visible and undoable there — and queue a new paid generation:</P>
         <SpecTable
           head={['Action', 'Directive it appends']}
           rows={[
@@ -436,8 +465,16 @@ rhythmic intensity.`}</CodeBlock>
         </Note>
         <H>The waveform</H>
         <P>
-          The MASTER lane draws real decoded peaks from the version's actual audio. Versions that haven't generated
-          yet render as a flat line. The <Chip>+</Chip> tab fires a fresh generation with your current settings.
+          The MASTER lane draws real decoded peaks from the version's actual audio. A version whose audio file cannot
+          be read shows a flat line, and EXPORT stays disabled for it. Left-click or drag the lane to scrub.
+          Right-clicking it opens a menu — <em>Seek here</em>, <em>Analyze this version</em>, <em>Export this
+          version</em> — and <strong>does not move the playhead</strong>; only the explicit Seek here item does. The{' '}
+          <Chip>+</Chip> tab fires a fresh generation with your current settings.
+        </P>
+        <P>
+          Under the inspector's actions, LYRICS shows the words actually sung in this generation as the provider
+          returned them, with the provider's own structural and timing markup (<Chip>[[A0]]</Chip>, <Chip>[:]</Chip>,{' '}
+          <Chip>[2.0:6.1]</Chip>) stripped out before display.
         </P>
       </>
     ),
@@ -451,25 +488,35 @@ rhythmic intensity.`}</CodeBlock>
         <SpecTable
           head={['Tool', 'What it does']}
           rows={[
-            ['CHANGE STYLE', 'Generates a new version from the current prompt (paid: $0.08 Pro / $0.04 Clip).'],
+            ['CHANGE STYLE', 'Asks for a style instruction, appends that line to the PROMPT box — where you can read and undo it — then generates a new version from it (paid: $0.08 Pro / $0.04 Clip). Nothing is charged until you submit an instruction.'],
             ['EDIT LYRICS', 'Opens and pins the lyrics editor.'],
-            ['INSTRUMENTAL', 'Adds an instrumental-only instruction and generates a new version (paid).'],
+            ['INSTRUMENTAL', 'Generates one instrumental version (paid): no lyrics are sent and the instrumental directive goes into that single request only. Your prompt box and the VOCALS toggle are left untouched.'],
           ]}
         />
         <H>History — the permanent library</H>
         <P>
           HISTORY lists every generation ever persisted, newest first. Click an entry to load it as a version tab.
-          Right-click for more: <em>Load (audio only)</em>, <em>Load with settings</em> (restores the prompt and chips
-          that made it), <em>Rename</em>, <em>Analyze</em>, <em>Download</em>, <em>Remove from list</em>.
+          Right-click for more: <em>Load (audio only)</em>, <em>Load with settings</em>, <em>Rename…</em> (inline, in
+          the row), <em>Analyze</em>, <em>Download</em>, <em>Remove from list</em>.
+        </P>
+        <P>
+          <em>Load with settings</em> restores the prompt and lyrics plus the chips that produced the take — model,
+          and, for takes recorded since those fields existed, language, duration target and batch size. Anything the
+          manifest does not record is left as-is rather than reset to a default.
         </P>
         <Note>
-          Remove and CLEAR only tidy the list display — <strong>audio files on disk are never deleted</strong>. A MOCK
+          Remove and CLEAR only tidy the list display, and the hidden rows stay hidden after a reload — it is a
+          per-browser view preference, and <strong>audio files on disk are never deleted</strong>. Whenever anything is
+          hidden, a <Chip>SHOW N HIDDEN</Chip> button appears next to CLEAR and brings every row straight back. A MOCK
           badge marks simulated dev-mode results that no real provider generated.
         </Note>
         <H>Export</H>
         <P>
-          EXPORT downloads the active version's <strong>native</strong> generated file: WAV for Pro, MP3 for Clip —
-          exactly the file the server wrote, no conversion.
+          EXPORT downloads the active version's <strong>native</strong> generated file — the exact bytes the server
+          wrote, with no conversion and no format chooser. The panel reports the real format it detected rather than
+          offering you one. The download is named after the track title (sanitized for your filesystem), falling back
+          to the generation id. When the active version has no audio, the panel reads <Chip>NO AUDIO YET</Chip> and the
+          button is disabled.
         </P>
       </>
     ),
@@ -482,9 +529,16 @@ rhythmic intensity.`}</CodeBlock>
         <H>Provider</H>
         <P>
           The AI PROVIDER selector (<Chip>GEMINI</Chip> | <Chip>OPENROUTER</Chip>) routes <strong>everything</strong> —
-          prompt/lyric AI assistance and music generation both go through the selected provider. Generation prices are
-          identical on both.
+          prompt/lyric AI assistance, analysis and music generation all go through the selected provider. Generation
+          prices are identical on both.
         </P>
+        <Note>
+          <strong>What each provider needs before it will generate.</strong> Gemini <em>generation</em> requires a{' '}
+          <strong>billing-enabled</strong> Google API key: the free tier grants zero Lyria requests per day, so a
+          free-tier key fails at once with <Chip>429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per
+          day on Free Tier)</Chip> — a quota wall that retrying never clears. OpenRouter requires account credits and
+          refuses audio requests under a <strong>$0.50</strong> balance; it returns MP3 for both Pro and Clip.
+        </Note>
         <H>API keys</H>
         <UL
           items={[
@@ -518,7 +572,8 @@ rhythmic intensity.`}</CodeBlock>
             <><strong>No stems, MIDI, or chords.</strong> Output is one mixed stereo master.</>,
             <><strong>No seed / reproducibility.</strong> The same prompt may produce different results between calls.</>,
             <><strong>No multi-candidate parameter.</strong> BATCH is N parallel full-price requests.</>,
-            <><strong>Timing is approximate.</strong> Timestamps and duration language guide, they don't bind.</>,
+            <><strong>No guaranteed duration.</strong> DUR and timestamps are prompt-side targets, not parameters the API enforces — the returned track can be materially longer or shorter than asked.</>,
+            <><strong>No choice of container.</strong> You get whatever the provider encodes — MP3 for both models on OpenRouter.</>,
             <><strong>Lyric adherence is not guaranteed.</strong></>,
           ]}
         />

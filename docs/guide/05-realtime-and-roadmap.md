@@ -38,24 +38,32 @@ Jitter-buffer ~1s (192 KB) before playback; never touch network/JSON on the audi
 
 Unrelated to RealTime: `interactions.create(..., stream=True)` emits `content.delta` events (lyrics text, audio chunks) during a normal Lyria 3 generation. Cheap UX win — stream lyrics into the UI instead of a spinner.
 
+## Already shipped (no longer roadmap)
+
+- **Real generation wiring** — the [04](04-app-integration.md) mapping is built: `POST /api/lyria/generate` assembles the prompt server-side, calls Gemini or OpenRouter, persists audio + manifest, and fires `lyria-generated`. Both provider paths are implemented; each needs its own paid entitlement first — billing enabled on a Google key (free-tier Lyria quota is 0/day), or ≥$0.50 credit on OpenRouter (see [01](01-lyria-models.md#provider-reality)).
+- **Version manifests** — every generation writes `generations/<id>.json`, and HISTORY is the real persistent log built on top of them.
+- **Audio analysis** — a manual, paid analysis pass turns a finished track into genre/mood/BPM/key/instrumentation plus timestamped sections, cached in the manifest and drawn on the timeline.
+
 ## Roadmap candidates for this app
 
-1. **Real generation wiring** — the [04](04-app-integration.md) mapping through `server.ts` (assemble prompt → interactions.create → persist audio + manifest → `lyria-generated`). Lyria 3 deep dive §8 is the reference.
-2. **Streaming generation UX** — `stream=True`; lyric deltas into the lyrics panel, orb pulses per chunk.
-3. **JAM mode (Lyria RealTime)** — the natural fit for this UI:
+1. **Streaming generation UX** — `stream=True` on the Gemini path; lyric deltas into the lyrics panel, orb pulses per chunk. (OpenRouter already streams, but the server accumulates the whole SSE body before responding.)
+2. **JAM mode (Lyria RealTime)** — the natural fit for this UI:
    - INTENT/ENERGY/DENSITY/ACOUSTICNESS stats → real inputs (weighted prompts + `density`/`brightness`)
    - TEMPO/KEY in the top bar → `bpm` + `scale` (hard changes — schedule on bar boundaries, fire `resetContext`)
    - Transport play/pause/stop → `session.play()/pause()/stop()`
-   - Track M buttons → `muteBass`/`muteDrums`/`onlyBassAndDrums` (note: only bass/drums are controllable — not all six lanes)
+   - Mute controls → `muteBass`/`muteDrums`/`onlyBassAndDrums` (note: only bass and drums are controllable; the timeline has a single MASTER lane today, so there are no per-stem mute buttons to map)
    - Section-based scenes → the deep dive §29 scene system (prompt morphs + config patches per section)
-   - Capture → PCM16→WAV recorder (§25) feeding the version tabs as "live takes"; stems via theDAW afterwards
+   - Capture → PCM16→WAV recorder (§25) feeding the version tabs as "live takes"
    - Constraint to design around: **instrumental only** — the lyrics panel is inert in JAM mode.
-4. **Batch as native sample_count** — if Google ships it for Lyria 3, the BATCH chip maps to one request with zero UI change.
-5. **Version manifests** — persist per-generation manifests; HISTORY becomes the real log (prompt diffs between versions).
+3. **Batch as native sample_count** — if Google ships it for Lyria 3, the BATCH chip maps to one request with zero UI change.
+4. **Prompt diffs between versions** — the manifests already record each version's prompt and settings; HISTORY could show what changed between two takes.
+5. **Provider-specific handling on the Gemini generation path** — everything is implemented; what remains is exercising it on a billing-enabled Google key and pinning down its real behavior (including which container Pro actually returns) rather than assuming the documented one.
 
 ## Watch list
 
 - `sample_count` / `seed` arriving on Lyria 3 (exists on `lyria-002` today)
 - Lyria RealTime leaving experimental (`v1alpha`) — model ID/params/quotas can all change
-- WAV for the Clip model; >3-minute Pro generations
+- Whether the documented Pro WAV path materializes in practice — OpenRouter returns MP3 for Pro and Clip alike regardless of the requested format
+- Lyria generation quota on Google's free tier moving off 0 requests/day
+- \>3-minute Pro generations, and any real duration control
 - Live Music Models paper: https://arxiv.org/abs/2508.04651

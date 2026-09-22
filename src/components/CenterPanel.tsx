@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { Play, Pause, MoreVertical, Plus, Volume2, VolumeX, MoreHorizontal, RefreshCcw, Maximize2, Sparkles, X, Lock, ZoomIn, ZoomOut, Loader2 } from 'lucide-react';
 import { Waveform } from './Waveform';
 import { SidebarLeft } from './SidebarLeft';
@@ -6,11 +6,15 @@ import { SidebarLeft } from './SidebarLeft';
 // SidebarRight — one mapping for both the version-tab and history-row "Load settings"
 // actions instead of two drift-prone copies.
 import { SidebarRight, modelIdToLabel } from './SidebarRight';
-import { ExportPanel } from './ExportPanel';
+// sanitizeExportName is shared with the EXPORT panel so a tab-menu export and a panel
+// export name the file the same way — and neither can be pushed outside the download
+// folder by a title containing a path separator.
+import { ExportPanel, sanitizeExportName } from './ExportPanel';
 import { ContextMenuHost, showContextMenu } from './ContextMenu';
 import { extractPeaks } from '../lib/waveformData';
 import { buildTimelineSections, sectionIndexAt, formatSeconds } from '../lib/sections';
 import { analyzeGeneration, listGenerations, renameGeneration, type Analysis, type GenerationEntry, type Project } from '../lib/lyriaClient';
+import { stripProviderLyricMarkup } from '../lib/lyricsText';
 import { projectStore } from '../lib/projectStore';
 import { player } from '../lib/player';
 
@@ -18,17 +22,57 @@ import { player } from '../lib/player';
 // with the number of bars it would otherwise render.
 const WAVEFORM_DEFAULT_BARS = 200;
 
-// The standard placeholder seeds shown for a brand-new project with no generations yet
-// (matches the module's original initial `useState` value).
-const PLACEHOLDER_VERSIONS: Version[] = [{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }];
+// A project with no generations has no versions: there are no seeded tabs, no seeded
+// active version, and nothing for the timeline to draw. `0` is the "no active version"
+// sentinel (real tabs are numbered from 1).
+const NO_ACTIVE_VERSION = 0;
 
-// Display label -> real model id, for the MODEL stat readout. Module-scoped so the
-// map isn't re-created on every render.
-const MODEL_IDS: Record<string, string> = {
-  'LYRIA 3 PRO': 'lyria-3-pro-preview',
-  'LYRIA 3 CLIP': 'lyria-3-clip-preview',
-  'LYRIA 2': 'lyria-002',
-};
+// Identity of one section-directive slot in the prompt. The same section (name + range,
+// exactly what the directive text itself is built from) and the same action always map
+// to the same key, so pressing an action twice replaces its own line instead of
+// stacking a new one every click.
+function directiveKey(action: string, name: string, range: string): string {
+  return `${action}|${name}|${range}`;
+}
+
+/**
+ * Removes every line equal to `line` from `prompt` (directives are always written as
+ * their own line). Returns null when nothing matched — the caller then knows the
+ * directive is no longer there (the user edited or undid it) and must not rewrite
+ * the prompt.
+ */
+function removePromptLine(prompt: string, line: string): string | null {
+  const target = line.trim();
+  if (!target) return null;
+  const lines = prompt.split(/\r?\n/);
+  const kept = lines.filter(l => l.trim() !== target);
+  if (kept.length === lines.length) return null;
+  return kept.join('\n').trimEnd();
+}
+
+// The AI provider an analyze call will actually route to is the user's Settings choice
+// (localStorage 'ai_provider', forwarded as the x-ai-provider header by
+// analyzeGeneration), falling back to the server's own default. Subscribed through
+// useSyncExternalStore so the readout follows the stored choice instead of freezing
+// whatever was set at mount.
+function subscribeToProviderChoice(onChange: () => void): () => void {
+  // 'storage' only fires in OTHER tabs, so Settings also broadcasts
+  // 'lyria-provider-change' for the tab that saved the choice.
+  window.addEventListener('storage', onChange);
+  window.addEventListener('lyria-provider-change', onChange);
+  return () => {
+    window.removeEventListener('storage', onChange);
+    window.removeEventListener('lyria-provider-change', onChange);
+  };
+}
+
+function readProviderChoice(): string {
+  try {
+    return localStorage.getItem('ai_provider') ?? '';
+  } catch {
+    return ''; // storage unavailable — fall back to the server default
+  }
+}
 
 export interface Version {
   n: number;
@@ -41,14 +85,13 @@ export interface Version {
   provider?: string;
   structure?: unknown;
   analysis?: Analysis;
-  // Pinned contract: optional user-supplied or renamed track title (server agent,
-  // lands at next server restart) — used for the tab tooltip and rename dialogs.
+  // Optional user-supplied or renamed track title — used for the tab tooltip and rename dialogs.
   title?: string;
   // Real measured track duration from the manifest (wav parsed, clip constant) —
   // the denominator for the detected-structure timeline's section widths.
   durationSeconds?: number;
-  // Absent/empty today — the server only returns a single mixed master. theDAW
-  // backend will eventually populate this once it can separate real stems.
+  // Absent/empty today — the server only returns a single mixed master. Populated
+  // only if a backend ever supplies real separated stems.
   stems?: { name: string; audioUrl: string }[];
 }
 
@@ -75,14 +118,13 @@ function materializeVersion(payload: Partial<GenerationEntry> & { id?: string },
 }
 
 export function CenterPanel() {
-  const [versions, setVersions] = useState<Version[]>([{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }]);
-  const [activeVersion, setActiveVersion] = useState(4);
+  const [versions, setVersions] = useState<Version[]>([]);
+  const [activeVersion, setActiveVersion] = useState(NO_ACTIVE_VERSION);
   const [freshVersions, setFreshVersions] = useState<number[]>([]);
   // Synchronous mirror of `versions` for event handlers — state updaters must stay pure,
   // so nextN/added are computed from this ref and updated wherever versions changes.
   const versionsRef = useRef<Version[]>(versions);
   const [modelName, setModelName] = useState('LYRIA 3 PRO');
-  const [durationTarget, setDurationTarget] = useState('3:00');
   const [lockedSections, setLockedSections] = useState<Record<string, boolean>>({});
   const [selectedSectionIdx, setSelectedSectionIdx] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1);
@@ -114,14 +156,14 @@ export function CenterPanel() {
       setVersions(next);
       setActiveVersion(added.n);
       setFreshVersions([added.n]);
-      // Cinematic reveal: the first arrival of the batch auto-plays…
+      // Cinematic reveal: the first arrival of the batch auto-plays. Analysis is NOT
+      // run here — it is a paid call of its own, so it only ever happens on an explicit
+      // user click (the ANALYZE button, the version-tab menu, the waveform-lane menu,
+      // or a HISTORY row's Analyze action via 'lyria-request-analysis').
       if (autoPlayArmedRef.current && added.audioUrl) {
         autoPlayArmedRef.current = false;
         autoPlayVersionNRef.current = added.n;
       }
-      // …and every arrival auto-analyzes (server-cached; deterministic mock in $0 dev
-      // mode) so GENRE/MOOD/BPM/KEY and the detected structure cascade in unprompted.
-      if (added.id) void handleAnalyze(added.id);
       if (freshVersionsTimeoutRef.current != null) window.clearTimeout(freshVersionsTimeoutRef.current);
       freshVersionsTimeoutRef.current = window.setTimeout(() => {
         freshVersionsTimeoutRef.current = null;
@@ -132,18 +174,12 @@ export function CenterPanel() {
       const m = (e as CustomEvent).detail?.model;
       if (m) setModelName(m);
     };
-    const handleDurationChange = (e: Event) => {
-      const d = (e as CustomEvent).detail?.duration;
-      if (d) setDurationTarget(d);
-    };
 
     window.addEventListener('lyria-generated', handleGenerated);
     window.addEventListener('lyria-model-change', handleModelChange);
-    window.addEventListener('lyria-duration-change', handleDurationChange);
     return () => {
       window.removeEventListener('lyria-generated', handleGenerated);
       window.removeEventListener('lyria-model-change', handleModelChange);
-      window.removeEventListener('lyria-duration-change', handleDurationChange);
       if (freshVersionsTimeoutRef.current != null) {
         window.clearTimeout(freshVersionsTimeoutRef.current);
         freshVersionsTimeoutRef.current = null;
@@ -195,7 +231,8 @@ export function CenterPanel() {
   // order, reusing materializeVersion so the mapping stays identical to the live and
   // history-load paths above. Ids no longer present in the generations library are
   // skipped rather than rendered as broken tabs. Empty versionIds (a brand-new project)
-  // falls back to the same placeholder seeds the module started with.
+  // means no tabs at all — the timeline shows its empty state instead of seeded ones,
+  // and the project's first real generation becomes V1 both now and after a reload.
   useEffect(() => {
     const handleProjectLoad = (e: Event) => {
       const project = (e as CustomEvent<{ project: Project }>).detail?.project;
@@ -206,9 +243,9 @@ export function CenterPanel() {
 
       const versionIds = project.versionIds ?? [];
       if (versionIds.length === 0) {
-        versionsRef.current = PLACEHOLDER_VERSIONS;
-        setVersions(PLACEHOLDER_VERSIONS);
-        setActiveVersion(PLACEHOLDER_VERSIONS[PLACEHOLDER_VERSIONS.length - 1].n);
+        versionsRef.current = [];
+        setVersions([]);
+        setActiveVersion(NO_ACTIVE_VERSION);
         setTimeout(() => { isRestoringVersionsRef.current = false; }, 0);
         return;
       }
@@ -227,19 +264,20 @@ export function CenterPanel() {
             restored.push(materializeVersion(entry, n));
             n += 1;
           }
-          const next = restored.length > 0 ? restored : PLACEHOLDER_VERSIONS;
-          versionsRef.current = next;
-          setVersions(next);
-          setActiveVersion(next[next.length - 1].n);
+          versionsRef.current = restored;
+          setVersions(restored);
+          setActiveVersion(restored.length > 0 ? restored[restored.length - 1].n : NO_ACTIVE_VERSION);
         })
         .catch((err) => {
           if (projectLoadRequestRef.current !== requestId) return; // stale — outcome belongs to a superseded load
           const storeCurrent = projectStore.current();
           if (storeCurrent && storeCurrent.id !== project.id) return;
           console.warn('Failed to restore project versions:', err);
-          versionsRef.current = PLACEHOLDER_VERSIONS;
-          setVersions(PLACEHOLDER_VERSIONS);
-          setActiveVersion(PLACEHOLDER_VERSIONS[PLACEHOLDER_VERSIONS.length - 1].n);
+          // The library is unreachable, so nothing about this project's versions is
+          // known — show no tabs rather than inventing any.
+          versionsRef.current = [];
+          setVersions([]);
+          setActiveVersion(NO_ACTIVE_VERSION);
         })
         .finally(() => {
           // Superseded loads must not clear the flag out from under the newer load —
@@ -317,7 +355,7 @@ export function CenterPanel() {
       });
   }, [activeVersion, versions]);
 
-  // Per-stem peaks for the active version's stems, if theDAW backend has supplied any
+  // Per-stem peaks for the active version's stems, if a backend has supplied any
   // (see Version.stems). Keyed by stem name. Same null/[]-semantics and stale-request
   // guarding as the master peaks above, but tracked per stem so one slow decode doesn't
   // block another stem's lane from rendering.
@@ -332,7 +370,26 @@ export function CenterPanel() {
   );
   const selectedSection = selectedSectionIdx !== null ? timelineSections[selectedSectionIdx] : undefined;
   // Section lock state is per version + section index (sections are real per-track data now).
+  // Separate from directiveKey() below, which keys the prompt text a lock wrote by the
+  // section's own name + range so UNLOCK can find and remove exactly that line.
   const lockKeyFor = (idx: number) => `${activeVersionData?.id ?? 'none'}:${idx}`;
+
+  // Inspector lyrics: the provider echoes its own structural/timing markup ([[A0]],
+  // [2.0:6.1], [:]) around the sung lines. Readers get the cleaned text — the same
+  // stripper the rest of the app shares.
+  const activeLyrics = useMemo(
+    () => stripProviderLyricMarkup(activeVersionData?.lyrics ?? ''),
+    [activeVersionData?.lyrics],
+  );
+
+  // INFO readouts: the ACTIVE VERSION's real values, never the current chip settings.
+  // Duration is the measured length recorded in the manifest; unknown stays unknown
+  // (an em dash) rather than being filled in with the requested target.
+  const activeDurationSeconds = activeVersionData?.durationSeconds;
+  const activeDurationLabel = typeof activeDurationSeconds === 'number' && Number.isFinite(activeDurationSeconds) && activeDurationSeconds > 0
+    ? formatSeconds(activeDurationSeconds)
+    : null;
+  const activeModelLabel = activeVersionData?.model?.trim() || null;
 
   // Selection belongs to one version's detected sections — switching versions resets it.
   useEffect(() => {
@@ -393,9 +450,10 @@ export function CenterPanel() {
   }, [activeVersion, JSON.stringify(activeStems)]);
 
   // Real audio analysis (GENRE/MOOD/ENERGY/BPM/KEY/instrumentation/sections) — one paid
-  // call per generation, triggered manually via the ANALYZE button and cached on the
-  // version + persisted server-side into the manifest. Keyed by generation id so state
-  // survives switching tabs and doesn't leak between versions.
+  // call per generation, run ONLY from an explicit user action (the ANALYZE button, the
+  // version-tab menu, the waveform-lane menu, or a HISTORY row's Analyze) and cached on
+  // the version + persisted server-side into the manifest. Keyed by generation id so
+  // state survives switching tabs and doesn't leak between versions.
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [analysisError, setAnalysisError] = useState<{ id: string; message: string } | null>(null);
   // Synchronous re-entrancy guard keyed per generation id (state alone can't guard —
@@ -427,8 +485,42 @@ export function CenterPanel() {
     }
   };
 
+  // Which provider that paid analyze call will actually go to: the Settings choice wins
+  // (analyzeGeneration forwards it as x-ai-provider), otherwise the server's configured
+  // default. Null while neither is known — the readout then names no provider rather
+  // than claiming the wrong one.
+  const providerChoice = useSyncExternalStore(subscribeToProviderChoice, readProviderChoice);
+  const [serverDefaultProvider, setServerDefaultProvider] = useState<'gemini' | 'openrouter' | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/settings/status')
+      .then(r => (r.ok ? r.json() : null))
+      .then((status: { defaultProvider?: string } | null) => {
+        if (cancelled) return;
+        const fallback = status?.defaultProvider;
+        setServerDefaultProvider(fallback === 'openrouter' || fallback === 'gemini' ? fallback : null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn('Failed to read the server AI provider default:', err);
+        setServerDefaultProvider(null);
+      });
+    return () => { cancelled = true; };
+  }, []);
+  const analysisProvider = providerChoice === 'openrouter' || providerChoice === 'gemini'
+    ? providerChoice
+    : serverDefaultProvider;
+  // Gemini analyses always run on gemini-3.5-flash (server-side constant). The
+  // OpenRouter model is server-configured (OPENROUTER_ANALYZE_MODEL) and not visible
+  // from here, so that path names the provider only.
+  const analysisProviderLabel = analysisProvider === 'openrouter'
+    ? 'openrouter'
+    : analysisProvider === 'gemini'
+      ? 'gemini-3.5-flash'
+      : null;
+
   // 'lyria-request-analysis' {id} — dispatched by SidebarRight's row "Analyze" action.
-  // Keep it simple per spec: activate the version first via the existing load path
+  // Keep it simple: activate the version first via the existing load path
   // (so the id is guaranteed to be materialized as a tab), then run the same ANALYZE
   // flow the button already uses.
   useEffect(() => {
@@ -446,7 +538,7 @@ export function CenterPanel() {
   }, []);
 
   // Sync tab titles/tooltips when a rename happens elsewhere (SidebarRight's row rename,
-  // or this panel's own renameVersionTab below broadcasting to keep everyone in sync).
+  // or this panel's own commitRenameVersion below broadcasting to keep everyone in sync).
   useEffect(() => {
     const handleRenamed = (e: Event) => {
       const { id, title } = (e as CustomEvent<{ id?: string; title?: string }>).detail ?? {};
@@ -472,22 +564,38 @@ export function CenterPanel() {
     }));
   };
 
-  // Version-tab context menu action: inline rename via window.prompt (no dedicated
-  // tab-header input in this layout) — renameGeneration when the version has an id;
-  // updates this tab's title/tooltip and broadcasts so SidebarRight's row stays in sync.
-  const renameVersionTab = async (v: Version) => {
+  // Version-tab rename: the tab swaps to an inline input, exactly like a HISTORY row
+  // (see SidebarRight's beginRename/commitRename) — Enter commits, Escape cancels, blur
+  // commits. `renamingVersionId` holds the generation id being renamed, so the input
+  // follows the version rather than a tab position.
+  const [renamingVersionId, setRenamingVersionId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  const beginRenameVersion = (v: Version) => {
     if (!v.id) return;
-    const next = window.prompt('Rename version', v.title || '');
-    if (next === null) return;
-    const trimmed = next.trim();
-    if (!trimmed) return;
+    setRenamingVersionId(v.id);
+    setRenameValue(v.title || '');
+    setTimeout(() => {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    }, 0);
+  };
+
+  // Persists through the same rename API the HISTORY rows use, then updates this tab's
+  // title/tooltip and broadcasts so SidebarRight's row stays in sync.
+  const commitRenameVersion = async (v: Version) => {
+    const nextTitle = renameValue.trim();
+    setRenamingVersionId(null);
+    if (!v.id || !nextTitle || nextTitle === (v.title ?? '')) return;
     try {
-      const updated = await renameGeneration(v.id, trimmed);
+      const updated = await renameGeneration(v.id, nextTitle);
+      const title = updated.title ?? nextTitle;
       const prev = versionsRef.current;
-      const nextVersions = prev.map(x => (x.id === v.id ? { ...x, title: updated.title ?? trimmed } : x));
+      const nextVersions = prev.map(x => (x.id === v.id ? { ...x, title } : x));
       versionsRef.current = nextVersions;
       setVersions(nextVersions);
-      window.dispatchEvent(new CustomEvent('lyria-generation-renamed', { detail: { id: v.id, title: updated.title ?? trimmed } }));
+      window.dispatchEvent(new CustomEvent('lyria-generation-renamed', { detail: { id: v.id, title } }));
     } catch (err) {
       console.warn('Failed to rename version', v.id, err);
     }
@@ -501,7 +609,10 @@ export function CenterPanel() {
     // break `.split('.').pop()`); the query/hash-stripped path extension is only a
     // fallback for entries without a format field.
     const ext = (v.format || v.audioUrl.split(/[?#]/)[0].split('.').pop() || 'wav').toLowerCase();
-    a.download = `${v.title || `lyria-v${v.n}`}.${ext}`;
+    // Same naming rule as the EXPORT panel: sanitized title, then the generation id,
+    // then the tab number — never a raw title straight into a file name.
+    const base = sanitizeExportName(v.title || '') || sanitizeExportName(v.id || '') || `lyria-v${v.n}`;
+    a.download = `${base}.${ext}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -510,7 +621,7 @@ export function CenterPanel() {
   const openVersionTabMenu = (e: React.MouseEvent, v: Version) => {
     showContextMenu(e, [
       { label: 'Load settings from this version', onClick: () => loadParamsFromVersion(v) },
-      { label: 'Rename…', onClick: () => void renameVersionTab(v), disabled: !v.id },
+      { label: 'Rename…', onClick: () => beginRenameVersion(v), disabled: !v.id },
       { label: 'Analyze', onClick: () => v.id && handleAnalyze(v.id), disabled: !v.id },
       { label: 'Export', onClick: () => exportVersion(v), disabled: !v.audioUrl },
     ]);
@@ -534,6 +645,57 @@ export function CenterPanel() {
     ]);
   };
 
+  // Section directives this panel has written into the prompt: directiveKey -> the exact
+  // line it appended. It is what makes a repeated action replace its own previous line
+  // instead of stacking one per click, and what lets UNLOCK remove exactly the line LOCK
+  // added.
+  const sectionDirectivesRef = useRef<Map<string, string>>(new Map());
+
+  // The prompt text as the editor currently holds it. SidebarLeft mirrors every prompt
+  // edit into projectStore synchronously (optimistic apply), so this is the same string
+  // the textarea shows. Null before the store has initialized — nothing to rewrite then.
+  const readPromptText = (): string | null => {
+    const project = projectStore.current();
+    return project ? project.prompt ?? '' : null;
+  };
+
+  // Rewrites the whole prompt through the existing 'lyria-load-params' contract — the
+  // only bus event that can REPLACE prompt text ('lyria-prompt-append' can only add).
+  // Used just for the replace/remove paths below, so a first-time directive still goes
+  // through the plain append (and keeps its own undo entry).
+  const writePromptText = (text: string) => {
+    window.dispatchEvent(new CustomEvent('lyria-load-params', { detail: { prompt: text } }));
+  };
+
+  // Writes the directive for one (section, action) slot, replacing the line this panel
+  // last wrote for that same slot when it is still in the prompt. If the prompt can't be
+  // read, or the user has since edited/undone that line, it falls back to a plain append
+  // rather than rewriting text the user owns.
+  const writeSectionDirective = (key: string, text: string) => {
+    const previous = sectionDirectivesRef.current.get(key);
+    const prompt = previous === undefined ? null : readPromptText();
+    const without = prompt !== null && previous !== undefined ? removePromptLine(prompt, previous) : null;
+    if (without !== null) {
+      writePromptText(without ? `${without}\n${text}` : text);
+    } else {
+      window.dispatchEvent(new CustomEvent('lyria-prompt-append', { detail: { text } }));
+    }
+    sectionDirectivesRef.current.set(key, text);
+  };
+
+  // Removes the directive this panel wrote for `key` (UNLOCK's half of the lock toggle).
+  // A line the user has already edited out is simply forgotten — never re-removed.
+  const clearSectionDirective = (key: string) => {
+    const previous = sectionDirectivesRef.current.get(key);
+    sectionDirectivesRef.current.delete(key);
+    if (previous === undefined) return;
+    const prompt = readPromptText();
+    if (prompt === null) return;
+    const without = removePromptLine(prompt, previous);
+    if (without === null) return;
+    writePromptText(without);
+  };
+
   // Single-turn API: section edits are prompt directives + a fresh generation. The
   // range in every directive comes from the REAL detected section of the active
   // version's audio (buildTimelineSections above) — never from an invented layout.
@@ -548,19 +710,26 @@ export function CenterPanel() {
       restyle: `[${range}] ${name}: restyle with new texture and instrumentation`,
       replace: `[${range}] ${name}: replace with a contrasting section`,
     };
-    window.dispatchEvent(new CustomEvent('lyria-prompt-append', { detail: { text: directives[action] } }));
+    writeSectionDirective(directiveKey(action, name, range), directives[action]);
     generateNewVersion();
   };
 
+  // LOCK and UNLOCK are symmetrical: locking writes the keep-as-is directive, unlocking
+  // takes that exact line back out, so a lock/unlock round trip leaves the prompt as it
+  // was found.
   const toggleLockSection = () => {
     const sec = selectedSection;
     if (sec === undefined || selectedSectionIdx === null) return;
     const key = lockKeyFor(selectedSectionIdx);
     const next = !lockedSections[key];
     setLockedSections(prev => ({ ...prev, [key]: next }));
+    const range = `${formatSeconds(sec.startSeconds)} - ${formatSeconds(sec.endSeconds)}`;
+    const name = sec.name || 'section';
+    const promptKey = directiveKey('lock', name, range);
     if (next) {
-      const range = `${formatSeconds(sec.startSeconds)} - ${formatSeconds(sec.endSeconds)}`;
-      window.dispatchEvent(new CustomEvent('lyria-prompt-append', { detail: { text: `[${range}] ${sec.name || 'section'}: locked — keep exactly as is` } }));
+      writeSectionDirective(promptKey, `[${range}] ${name}: locked — keep exactly as is`);
+    } else {
+      clearSectionDirective(promptKey);
     }
   };
 
@@ -614,8 +783,16 @@ export function CenterPanel() {
         <div className="w-[320px] flex-shrink-0 flex flex-col gap-3 min-h-0">
           <SidebarLeft />
 
-          {/* Export */}
-          <ExportPanel version={activeVersion} model={modelName} audioUrl={versions.find(v => v.n === activeVersion)?.audioUrl ?? null} fileFormat={versions.find(v => v.n === activeVersion)?.format ?? null} />
+          {/* Export — fed the active version's own title and generation id so a renamed
+              track downloads under its real name instead of a bare lyria-vN file. */}
+          <ExportPanel
+            version={activeVersion}
+            model={modelName}
+            audioUrl={activeVersionData?.audioUrl ?? null}
+            fileFormat={activeVersionData?.format ?? null}
+            title={activeVersionData?.title ?? null}
+            versionId={activeVersionData?.id ?? null}
+          />
 
           <div className="flex-1" />
         </div>
@@ -701,7 +878,7 @@ export function CenterPanel() {
                 <button
                   onClick={() => activeVersionData.id && handleAnalyze(activeVersionData.id)}
                   disabled={!activeVersionData.id || analyzingId === activeVersionData.id}
-                  title="Run real audio analysis on this generation via gemini-3.5-flash — one paid call, pennies, cached forever"
+                  title={`Run real audio analysis on this generation${analysisProviderLabel ? ` via ${analysisProviderLabel}` : ''} — one paid call, pennies, cached forever`}
                   className="flex items-center gap-2 px-3 py-1.5 text-[8px] tracking-widest text-lyria-gold bg-gradient-to-b from-[#1d1816] to-[#14110f] hover:from-[#2b2521] hover:to-[#1d1816] border border-lyria-gold/40 rounded-lg transition-all duration-150 shadow-[inset_0_1px_0_rgba(255,255,255,0.03),0_2px_5px_rgba(0,0,0,0.3)] active:scale-[0.98] cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed lyria-focus-ring w-fit"
                 >
                   {analyzingId === activeVersionData.id ? (
@@ -711,7 +888,9 @@ export function CenterPanel() {
                   )}
                   {analyzingId === activeVersionData.id ? 'ANALYZING…' : 'ANALYZE'}
                 </button>
-                <span className="text-[8px] text-lyria-text-muted tracking-wide">gemini-3.5-flash · pennies per track</span>
+                {/* Names the provider the call will really route to (Settings choice, or
+                    the server default) — never a hardcoded one. */}
+                <span className="text-[8px] text-lyria-text-muted tracking-wide">{analysisProviderLabel ? `${analysisProviderLabel} · pennies per track` : 'pennies per track'}</span>
                 {analysisError?.id === activeVersionData.id && (
                   <span className="text-[8px] text-lyria-signal tracking-wide">{analysisError.message}</span>
                 )}
@@ -720,15 +899,31 @@ export function CenterPanel() {
           </div>
         )}
 
-        {/* Right Stats */}
+        {/* Right Stats — the ACTIVE VERSION's own recorded values (measured duration,
+            manifest model id), not the current chip settings. Nothing known → an em dash;
+            a duration is never inferred from the requested target. */}
         <div className="absolute right-0 top-0 bottom-0 w-48 p-6 flex flex-col justify-center items-end text-right gap-4 z-10 pointer-events-none lyria-dim-on-generate">
           <div>
             <span className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">DURATION</span>
-            <span className="text-sm text-lyria-text-main font-mono">{modelName === 'LYRIA 3 CLIP' ? '0:30' : durationTarget}</span>
+            <span
+              title={activeDurationLabel
+                ? 'Measured length of the active version’s audio file'
+                : activeVersionData
+                  ? 'This version’s manifest carries no measured duration'
+                  : 'No version loaded yet'}
+              className="text-sm text-lyria-text-main font-mono"
+            >{activeDurationLabel ?? '—'}</span>
           </div>
           <div>
             <span className="text-[9px] text-lyria-text-muted uppercase tracking-[0.2em] block mb-1">MODEL</span>
-            <span className="text-xs text-lyria-text-main font-mono opacity-80">{MODEL_IDS[modelName] ?? modelName}</span>
+            <span
+              title={activeModelLabel
+                ? 'The model that actually generated the active version'
+                : activeVersionData
+                  ? 'This version’s manifest records no model id'
+                  : 'No version loaded yet'}
+              className="text-xs text-lyria-text-main font-mono opacity-80"
+            >{activeModelLabel ?? '—'}</span>
           </div>
         </div>
         </div>
@@ -746,12 +941,33 @@ export function CenterPanel() {
               {/* Version tabs — one per generation */}
               <div className="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto">
                 <span className="font-display text-[8px] text-lyria-text-muted uppercase tracking-widest mr-1 shrink-0">VERSIONS</span>
+                {/* One tab per real generation in this project — no seeded tabs, so the
+                    first take of a new project is V1 and stays V1 across a reload. */}
+                {versions.length === 0 && (
+                  <span className="text-[9px] text-lyria-text-muted tracking-wide shrink-0">none yet</span>
+                )}
                 {versions.map((v) => (
+                  renamingVersionId !== null && v.id === renamingVersionId ? (
+                    <input
+                      key={v.n}
+                      ref={renameInputRef}
+                      type="text"
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') { e.preventDefault(); void commitRenameVersion(v); }
+                        if (e.key === 'Escape') { e.preventDefault(); setRenamingVersionId(null); }
+                      }}
+                      onBlur={() => void commitRenameVersion(v)}
+                      aria-label={`Rename version ${v.n}`}
+                      className="h-6 w-32 shrink-0 rounded px-1.5 text-[9px] font-display tracking-wider text-lyria-text-main bg-black/60 border border-lyria-gold/40 outline-none focus:border-lyria-gold transition-colors duration-150"
+                    />
+                  ) : (
                   <button
                     key={v.n}
                     onClick={() => setActiveVersion(v.n)}
                     onContextMenu={(e) => openVersionTabMenu(e, v)}
-                    title={v.audioUrl ? `${v.title ? `${v.title} — ` : ''}Switch to version ${v.n} — click Play to hear it${v.provider ? ` (${v.provider})` : ''} — right-click for more actions` : `Switch to version ${v.n} — placeholder (no audio yet)`}
+                    title={v.audioUrl ? `${v.title ? `${v.title} — ` : ''}Switch to version ${v.n} — click Play to hear it${v.provider ? ` (${v.provider})` : ''} — right-click for more actions` : `Switch to version ${v.n} — no audio attached`}
                     aria-pressed={activeVersion === v.n}
                     className={`h-6 px-2.5 rounded flex items-center gap-1 shrink-0 text-[9px] font-display tracking-wider border transition-all duration-150 active:scale-95 cursor-pointer lyria-focus-ring ${
                       activeVersion === v.n
@@ -764,6 +980,7 @@ export function CenterPanel() {
                       <span title="Simulated placeholder audio — not a real Lyria generation" className="px-1 rounded text-[6px] font-semibold tracking-wider bg-white/10 text-[#8b837c]">MOCK</span>
                     )}
                   </button>
+                  )
                 ))}
                 <button
                   onClick={generateNewVersion}
@@ -825,17 +1042,19 @@ export function CenterPanel() {
                <span className="text-[8px] leading-relaxed tracking-wide text-lyria-text-muted px-1">
                  {timelineSections.length > 0
                    ? 'Click a detected section in the timeline to inspect and direct it.'
-                   : 'Sections appear once this version’s audio has been analyzed.'}
+                   : activeVersionData
+                     ? 'Sections appear once this version’s audio has been analyzed.'
+                     : 'Generate a version, then analyze it, to map its sections.'}
                </span>
              )}
 
              {/* Real sung lyrics for the active version, when present — the actual paid-for
                  output of a generation, surfaced read-only rather than left with nowhere to show. */}
-             {activeVersionData?.lyrics && (
+             {activeLyrics && (
                <div className="flex flex-col gap-1.5">
-                 <span title="The actual sung lyrics returned by this generation" className="text-[8px] text-lyria-text-muted tracking-widest uppercase mb-0.5 ml-1">Lyrics</span>
+                 <span title="The actual sung lyrics returned by this generation, with the provider's structural and timing markup stripped" className="text-[8px] text-lyria-text-muted tracking-widest uppercase mb-0.5 ml-1">Lyrics</span>
                  <div className="max-h-40 overflow-y-auto rounded-lg border border-[#2b2521] bg-[#0d0a08] p-2">
-                   <pre className="text-[9px] leading-relaxed text-lyria-text-main/80 font-mono whitespace-pre-wrap break-words">{activeVersionData.lyrics}</pre>
+                   <pre className="text-[9px] leading-relaxed text-lyria-text-main/80 font-mono whitespace-pre-wrap break-words">{activeLyrics}</pre>
                  </div>
                </div>
              )}
@@ -849,10 +1068,22 @@ export function CenterPanel() {
         <div className="flex-1 flex flex-col min-w-0 relative bg-lyria-bg/50">
           
           <div className="flex-1 overflow-y-auto overflow-x-hidden relative flex">
-             
+             {versions.length === 0 ? (
+             /* Nothing has been generated in this project yet, so there is no audio,
+                no waveform and no structure to draw. Say so plainly instead of seeding
+                empty tabs and a flat placeholder lane. */
+             <div className="flex-1 flex flex-col items-center justify-center gap-2 px-6 text-center">
+               <span className="font-display text-[10px] text-lyria-text-muted uppercase tracking-[0.3em]">No versions yet</span>
+               <span className="text-[9px] leading-relaxed tracking-wide text-lyria-text-muted max-w-[360px]">
+                 Write a prompt in the rail on the right and press GENERATE. The first take lands here as V1, with its real waveform — analyze it to map its structure.
+               </span>
+             </div>
+             ) : (
+             <>
+
              {/* Tracks Headers (Fixed on left) */}
              <div className="w-[180px] shrink-0 border-r border-[#222] bg-[#14110f] z-20 flex flex-col pt-12">
-               {/* Stem sub-rows auto-populate from version.stems when theDAW backend supplies
+               {/* Stem sub-rows auto-populate from version.stems when a backend supplies
                    real stems; never render stem rows without data. Today the server only ever
                    returns a single mixed master, so this is just the MASTER cell. */}
                <div className="flex-1 border-b border-[#222] flex items-center justify-between px-3">
@@ -951,7 +1182,7 @@ export function CenterPanel() {
                 </div>
 
                 {/* Waveform Lanes: always MASTER, plus one sub-row per version.stems entry. */}
-                {/* Stem sub-rows auto-populate from version.stems when theDAW backend supplies
+                {/* Stem sub-rows auto-populate from version.stems when a backend supplies
                     real stems; never render stem rows without data. Lyria today returns only a
                     single mixed master, so with no stems this is just the one MASTER lane. */}
                 <div className="flex-1 flex flex-col relative transition-all duration-300" style={{ width: `${1000 * zoom}px`, minWidth: '100%' }}>
@@ -973,6 +1204,8 @@ export function CenterPanel() {
                    ))}
                 </div>
              </div>
+             </>
+             )}
           </div>
         </div>
         </div>

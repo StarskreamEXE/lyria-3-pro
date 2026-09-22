@@ -12,7 +12,14 @@ export function assembleLyriaPrompt(parts: PromptParts): string {
 
   const sections: string[] = [prompt];
   if (parts.model !== 'clip' && parts.durationTarget) {
-    sections.push(`Target duration: approximately ${parts.durationTarget}.`);
+    // Stated ONCE, as an explicit total running time AND as an end timestamp. The previous
+    // wording ("Target duration: approximately X.") was too weak to steer the model: a 1:00
+    // target came back as a 2:19 track on OpenRouter Pro. Neither the API nor this prompt can
+    // guarantee length — this is best-effort adherence, and nothing in the UI promises more.
+    sections.push(
+      `Total running time: ${parts.durationTarget}. The track starts at 0:00 and must reach its final note at ${parts.durationTarget}. ` +
+      `Structure the arrangement to fill exactly that span: do not end early, and do not run past ${parts.durationTarget}.`,
+    );
   }
   const lyrics = parts.lyrics.trim();
   if (lyrics) {
@@ -307,6 +314,155 @@ export function wavDurationSeconds(wav: Buffer): number | null {
   return Math.round(seconds * 10) / 10;
 }
 
+// ---------------------------------------------------------------------------
+// MP3 duration parsing. OpenRouter returns MP3 for Pro as well as Clip (verified: every Pro
+// manifest on disk is mp3), and those files carried NO durationSeconds, so HISTORY showed no
+// duration at all for them. Real parsing, never estimation: an unparseable buffer yields null
+// and the caller leaves durationSeconds undefined rather than guessing.
+// ---------------------------------------------------------------------------
+
+/** MPEG audio bitrate tables in kbps, keyed `<versionGroup>-<layer>`; index 0 (free) and 15 (bad) are rejected. */
+const MPEG_BITRATES_KBPS: Record<string, number[]> = {
+  '1-1': [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+  '1-2': [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+  '1-3': [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+  '2-1': [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+  '2-2': [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+  '2-3': [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+};
+
+/** Sampling-rate tables in Hz, keyed by MPEG version id (1, 2, 25 for MPEG 2.5). */
+const MPEG_SAMPLE_RATES: Record<number, number[]> = {
+  1: [44100, 48000, 32000],
+  2: [22050, 24000, 16000],
+  25: [11025, 12000, 8000],
+};
+
+interface MpegFrameHeader {
+  /** 1 = MPEG-1, 2 = MPEG-2, 25 = MPEG-2.5. */
+  version: number;
+  layer: 1 | 2 | 3;
+  sampleRate: number;
+  /** PCM samples represented by this frame (384 / 1152 / 576 depending on version+layer). */
+  samples: number;
+  /** Total frame size in bytes, including the 4-byte header and any padding byte. */
+  length: number;
+  mono: boolean;
+}
+
+/**
+ * Decodes a 4-byte MPEG audio frame header at `offset`, or returns null if the bytes are not a
+ * valid header (bad sync, reserved version/layer, free/bad bitrate index, reserved sampling index,
+ * or a nonsensical frame length). Deliberately strict: the frame walk below relies on an invalid
+ * header terminating the walk rather than silently drifting through garbage.
+ */
+function parseMpegFrameHeader(buf: Buffer, offset: number): MpegFrameHeader | null {
+  if (offset + 4 > buf.length) return null;
+  if (buf[offset] !== 0xff || (buf[offset + 1] & 0xe0) !== 0xe0) return null;
+
+  const versionBits = (buf[offset + 1] >> 3) & 0x03;
+  if (versionBits === 1) return null; // reserved
+  const version = versionBits === 3 ? 1 : versionBits === 2 ? 2 : 25;
+
+  const layerBits = (buf[offset + 1] >> 1) & 0x03;
+  if (layerBits === 0) return null; // reserved
+  const layer = (layerBits === 3 ? 1 : layerBits === 2 ? 2 : 3) as 1 | 2 | 3;
+
+  const bitrateIndex = (buf[offset + 2] >> 4) & 0x0f;
+  if (bitrateIndex === 0 || bitrateIndex === 15) return null; // free-format / bad
+  const samplingIndex = (buf[offset + 2] >> 2) & 0x03;
+  if (samplingIndex === 3) return null; // reserved
+
+  const bitrate = MPEG_BITRATES_KBPS[`${version === 1 ? 1 : 2}-${layer}`][bitrateIndex] * 1000;
+  const sampleRate = MPEG_SAMPLE_RATES[version][samplingIndex];
+  const padding = (buf[offset + 2] >> 1) & 0x01;
+  const mono = ((buf[offset + 3] >> 6) & 0x03) === 3;
+
+  const samples = layer === 1 ? 384 : layer === 2 ? 1152 : version === 1 ? 1152 : 576;
+  const length =
+    layer === 1
+      ? Math.floor((12 * bitrate) / sampleRate + padding) * 4
+      : Math.floor(((layer === 3 && version !== 1 ? 72 : 144) * bitrate) / sampleRate) + padding;
+  if (length <= 4) return null;
+
+  return { version, layer, sampleRate, samples, length, mono };
+}
+
+/** How far the Xing/Info tag sits from the start of the first frame (past the header + side info). */
+function xingTagOffset(header: MpegFrameHeader): number {
+  if (header.version === 1) return header.mono ? 21 : 36;
+  return header.mono ? 13 : 21;
+}
+
+/** Max bytes scanned for the first valid frame after any ID3v2 tag, so a garbage buffer can't spin. */
+const MP3_SYNC_SEARCH_WINDOW = 65536;
+
+/**
+ * Finds the offset of the first MPEG frame, requiring that the NEXT frame header also decodes at
+ * the computed frame length (or that the frame is the last thing in the buffer). The two-frame
+ * agreement rejects a stray 0xFFEx byte pair inside metadata or audio data being mistaken for the
+ * stream start. Returns -1 if no frame is found within MP3_SYNC_SEARCH_WINDOW.
+ */
+function findFirstMpegFrame(buf: Buffer, start: number): number {
+  const limit = Math.min(buf.length - 4, start + MP3_SYNC_SEARCH_WINDOW);
+  for (let offset = start; offset <= limit; offset++) {
+    const header = parseMpegFrameHeader(buf, offset);
+    if (!header) continue;
+    const next = offset + header.length;
+    if (parseMpegFrameHeader(buf, next) || next >= buf.length - 4) return offset;
+  }
+  return -1;
+}
+
+/**
+ * Parses an MP3 buffer's real duration in seconds, rounded to 1 decimal place (matching
+ * wavDurationSeconds). Skips any leading ID3v2 tag, locates the first MPEG frame, and:
+ *  - uses the frame count from a Xing/Info (VBR/ABR) or VBRI header when one is present, else
+ *  - walks every frame and sums samples/sampleRate, which is exact for CBR, VBR and ABR alike.
+ * Returns null — never an estimate — when the buffer is not a parseable MPEG stream (no frames,
+ * truncated header, or non-MP3 bytes such as the RIFF-in-a-.mp3-file legacy outputs on disk).
+ */
+export function mp3DurationSeconds(mp3: Buffer): number | null {
+  const tagLength = existingId3TagLength(mp3);
+  if (tagLength >= mp3.length) return null;
+
+  const firstOffset = findFirstMpegFrame(mp3, tagLength);
+  if (firstOffset < 0) return null;
+  const first = parseMpegFrameHeader(mp3, firstOffset)!;
+
+  // Xing/Info (LAME et al.) and VBRI (Fraunhofer) both carry an exact frame count up front.
+  const xingOffset = firstOffset + xingTagOffset(first);
+  if (xingOffset + 12 <= mp3.length) {
+    const tag = mp3.toString('latin1', xingOffset, xingOffset + 4);
+    if (tag === 'Xing' || tag === 'Info') {
+      const flags = mp3.readUInt32BE(xingOffset + 4);
+      if (flags & 0x01) {
+        const frames = mp3.readUInt32BE(xingOffset + 8);
+        if (frames > 0) return Math.round((frames * first.samples / first.sampleRate) * 10) / 10;
+      }
+    }
+  }
+  const vbriOffset = firstOffset + 36;
+  if (vbriOffset + 26 <= mp3.length && mp3.toString('latin1', vbriOffset, vbriOffset + 4) === 'VBRI') {
+    const frames = mp3.readUInt32BE(vbriOffset + 14);
+    if (frames > 0) return Math.round((frames * first.samples / first.sampleRate) * 10) / 10;
+  }
+
+  let seconds = 0;
+  let frameCount = 0;
+  let offset = firstOffset;
+  while (offset + 4 <= mp3.length) {
+    const header = parseMpegFrameHeader(mp3, offset);
+    if (!header) break; // trailing ID3v1/APE tag, padding, or truncation — stop cleanly
+    seconds += header.samples / header.sampleRate;
+    offset += header.length;
+    frameCount++;
+  }
+  if (frameCount === 0) return null;
+
+  return Math.round(seconds * 10) / 10;
+}
+
 /** Converts a regular (max 28-bit) integer into the 4-byte syncsafe form ID3v2 uses for its tag size. */
 function toSyncsafe(value: number): Buffer {
   const out = Buffer.alloc(4);
@@ -521,6 +677,8 @@ export interface GenerateRequestBody {
   format?: 'wav' | 'mp3';
   images?: { mimeType: string; data: string }[]; // base64, ≤10
   title?: string;
+  /** How many versions this one click asked for; echoed onto the manifest so History can restore it. */
+  batchCount?: number;
 }
 
 export interface GenerateResult {
@@ -551,6 +709,13 @@ export interface GenerationManifest {
   analysis?: Analysis;
   title?: string;
   durationSeconds?: number;
+  // The generation settings the request was made with, so History's "load with settings" can
+  // restore them. All three are optional and are omitted entirely when the request did not
+  // supply a usable value: manifests written before these fields existed simply have none, and
+  // every consumer must treat them as undefined rather than substituting a default.
+  language?: string;
+  durationTarget?: string;
+  batchCount?: number;
 }
 
 /** A manifest plus the derived static-file URL, as returned by listGenerations(). */
@@ -577,18 +742,42 @@ function normalizeTitle(rawTitle: unknown): string | undefined {
   return trimmed.length > TITLE_MAX_LENGTH ? trimmed.slice(0, TITLE_MAX_LENGTH) : trimmed;
 }
 
+/**
+ * Trims a raw request setting into a manifest string, or undefined when the request did not
+ * supply a usable one. Deliberately does NOT fall back to the prompt-assembly defaults ('EN',
+ * '3:00'): a manifest must record what the user actually asked for, or nothing at all.
+ */
+function normalizeSetting(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed || undefined;
+}
+
+/** Normalizes a requested batch size to a positive integer, or undefined for anything else. */
+function normalizeBatchCount(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
+  const rounded = Math.round(raw);
+  return rounded >= 1 ? rounded : undefined;
+}
+
 /** Builds the embedded ICMT comment: model=<model>; provider=<provider>; generated=<generatedAt>; plus a truncated prompt. */
 function buildEmbedComment(model: string, provider: string, generatedAt: string, prompt: string): string {
   const truncatedPrompt = prompt.length > COMMENT_PROMPT_MAX_LENGTH ? prompt.slice(0, COMMENT_PROMPT_MAX_LENGTH) : prompt;
   return `model=${model}; provider=${provider}; generated=${generatedAt}; prompt=${truncatedPrompt}`;
 }
 
-/** Derives durationSeconds for a freshly generated file: parsed from wav bytes, or a fixed constant for clip/mp3. */
-function computeDurationSeconds(format: 'wav' | 'mp3', model: string, audio: Buffer): number | undefined {
-  if (format === 'wav') {
-    return wavDurationSeconds(audio) ?? undefined;
-  }
-  return model.includes('clip') ? CLIP_MODEL_DURATION_SECONDS : undefined;
+/**
+ * Derives durationSeconds for a freshly generated file by really parsing the bytes: the RIFF
+ * fmt/data chunks for wav, the MPEG frame stream for mp3. The clip model's fixed 30s is only a
+ * last-resort fallback for bytes that will not parse at all; a parse failure on a pro/mp3 file
+ * leaves durationSeconds undefined rather than guessing a length.
+ * Exported (pure, no I/O) because the mock generator only ever emits wav bytes, so the mp3 branch
+ * of the fresh-generation path is unreachable through generateLyria without a paid provider call.
+ */
+export function computeDurationSeconds(format: 'wav' | 'mp3', model: string, audio: Buffer): number | undefined {
+  const parsed = format === 'wav' ? wavDurationSeconds(audio) : mp3DurationSeconds(audio);
+  if (parsed !== null) return parsed;
+  return format === 'mp3' && model.includes('clip') ? CLIP_MODEL_DURATION_SECONDS : undefined;
 }
 
 /** Thrown for client input errors; server.ts maps this to HTTP 400 (vs 500 for everything else). */
@@ -750,6 +939,11 @@ export async function generateLyria(
     : audio; // unknown bytes: persist verbatim — rebuilding/tagging could corrupt them
   const durationSeconds = computeDurationSeconds(actualFormat, model, audio);
 
+  // Generation settings recorded verbatim (never defaulted) so History can restore them later.
+  const language = normalizeSetting(body.language);
+  const durationTarget = normalizeSetting(body.durationTarget);
+  const batchCount = normalizeBatchCount(body.batchCount);
+
   const audioFile = `${id}.${actualFormat}`;
   await fs.writeFile(path.join(GEN_DIR, audioFile), embeddedAudio);
   const manifest: GenerationManifest = {
@@ -760,6 +954,9 @@ export async function generateLyria(
     ...(structure !== undefined ? { structure } : {}),
     ...(title !== undefined ? { title } : {}),
     ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+    ...(language !== undefined ? { language } : {}),
+    ...(durationTarget !== undefined ? { durationTarget } : {}),
+    ...(batchCount !== undefined ? { batchCount } : {}),
   };
   await writeJsonAtomic(path.join(GEN_DIR, `${id}.json`), manifest);
 
@@ -817,10 +1014,14 @@ export async function listGenerations(dir: string = GEN_DIR): Promise<Generation
 }
 
 /**
- * Lazily backfills durationSeconds onto a manifest that predates the field: parses the wav file
- * for real duration, or uses a fixed constant for clip/mp3 manifests. Writes the manifest back to
- * disk once so future calls skip the work. Tolerates a missing audio file (leaves it undefined,
- * does not persist/throw). No-ops (no re-parse, no rewrite) if durationSeconds is already set.
+ * Lazily backfills durationSeconds onto a manifest that predates the field, by really parsing the
+ * audio file — wav via the RIFF chunks, mp3 via the MPEG frame stream. This is what finally gives
+ * OpenRouter Pro outputs (which come back as MP3, not wav) a duration in HISTORY. The container is
+ * detected from the BYTES, not the manifest's claimed format, because pre-fix manifests can claim
+ * 'mp3' for files that are really RIFF. Only when the bytes will not parse at all does a clip
+ * manifest fall back to the model's fixed 30s; anything else is left undefined rather than guessed.
+ * Writes the manifest back to disk once so future calls skip the work. Tolerates a missing audio
+ * file (leaves it undefined, does not persist/throw). No-ops if durationSeconds is already set.
  */
 async function backfillDurationSeconds(
   manifest: GenerationManifest,
@@ -834,14 +1035,19 @@ async function backfillDurationSeconds(
   const format = manifest.format === 'mp3' ? 'mp3' : 'wav';
   let durationSeconds: number | undefined;
 
-  if (format === 'wav') {
-    try {
-      const audio = await fs.readFile(path.join(dir, `${manifest.id}.wav`));
+  try {
+    const audio = await fs.readFile(path.join(dir, `${manifest.id}.${format}`));
+    const detected = detectAudioFormat(audio);
+    if (detected === 'wav') {
       durationSeconds = wavDurationSeconds(audio) ?? undefined;
-    } catch {
-      durationSeconds = undefined; // audio file missing/unreadable — leave undefined
+    } else if (detected === 'mp3') {
+      durationSeconds = mp3DurationSeconds(audio) ?? undefined;
     }
-  } else if (manifest.model.includes('clip')) {
+  } catch {
+    durationSeconds = undefined; // audio file missing/unreadable — leave undefined
+  }
+
+  if (durationSeconds === undefined && format === 'mp3' && manifest.model.includes('clip')) {
     durationSeconds = CLIP_MODEL_DURATION_SECONDS;
   }
 
