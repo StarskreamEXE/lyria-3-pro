@@ -13,7 +13,7 @@ import { ExportPanel, sanitizeExportName } from './ExportPanel';
 import { ContextMenuHost, showContextMenu } from './ContextMenu';
 import { extractPeaks } from '../lib/waveformData';
 import { buildTimelineSections, sectionIndexAt, formatSeconds } from '../lib/sections';
-import { analyzeGeneration, listGenerations, renameGeneration, type Analysis, type GenerationEntry, type Project } from '../lib/lyriaClient';
+import { analyzeGeneration, listGenerations, renameGeneration, attemptsFromError, describeKeyAttempts, type Analysis, type GenerationEntry, type Project, type SettingsStatus } from '../lib/lyriaClient';
 import { stripProviderLyricMarkup } from '../lib/lyricsText';
 import { projectStore } from '../lib/projectStore';
 import { player } from '../lib/player';
@@ -476,7 +476,11 @@ export function CenterPanel() {
       window.dispatchEvent(new CustomEvent('lyria-analysis', { detail: { id, analysis } }));
     } catch (err) {
       console.warn('Failed to analyze generation', id, err);
-      setAnalysisError({ id, message: err instanceof Error ? err.message : 'Analysis failed' });
+      // One error surface for this failure, carrying the server's per-key rejection
+      // summary when it fell through several stored keys (indexes/statuses only).
+      const base = err instanceof Error ? err.message : 'Analysis failed';
+      const keySummary = describeKeyAttempts(attemptsFromError(err));
+      setAnalysisError({ id, message: keySummary ? `${base} — ${keySummary}` : base });
     } finally {
       analyzingIdsRef.current.delete(id);
       // Only clear the spinner if it still belongs to this id — a concurrent analyze
@@ -495,7 +499,9 @@ export function CenterPanel() {
     let cancelled = false;
     fetch('/api/settings/status')
       .then(r => (r.ok ? r.json() : null))
-      .then((status: { defaultProvider?: string } | null) => {
+      // Partial<SettingsStatus>: the key-count fields only exist on newer servers, and
+      // an older server answers without them — read defensively either way.
+      .then((status: Partial<SettingsStatus> | null) => {
         if (cancelled) return;
         const fallback = status?.defaultProvider;
         setServerDefaultProvider(fallback === 'openrouter' || fallback === 'gemini' ? fallback : null);

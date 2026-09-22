@@ -1,3 +1,172 @@
+import { loadKeys, withKeyHeaders, type Provider } from './apiKeys';
+
+// ---------------------------------------------------------------------------
+// Multi-key support
+//
+// The browser stores an ordered list of keys per provider (src/lib/apiKeys.ts).
+// Every provider-backed request sends the whole list; the server walks it and
+// falls back past key-level rejections (401/402/429). It then reports which key
+// it ended up using via `x-lyria-key-index`, and, when it had to fall back,
+// the rejected attempts via `x-lyria-key-attempts`.
+//
+// Nothing in here ever carries or renders key material: an attempt is only an
+// index, an HTTP status and a short reason.
+// ---------------------------------------------------------------------------
+
+/** One rejected key, as reported by the server. `index` is 0-based into the sent list. */
+export interface KeyAttempt {
+  index: number;
+  status?: number;
+  reason?: string;
+}
+
+/** What a provider-backed response says about key selection. */
+export interface KeyOutcome {
+  /** 0-based index of the key the server accepted, or null when it didn't say. */
+  usedIndex: number | null;
+  /** Rejected keys, in the order they were tried. Empty when the first key worked. */
+  attempts: KeyAttempt[];
+}
+
+/** Detail carried by the `lyria-key-fallback` window event. */
+export interface KeyFallbackDetail extends KeyOutcome {
+  provider: Provider | null;
+}
+
+export const KEY_FALLBACK_EVENT = 'lyria-key-fallback';
+
+/** Drops anything that isn't a plain {index,status,reason} record — key material can never survive this. */
+function normalizeAttempts(raw: unknown): KeyAttempt[] {
+  if (!Array.isArray(raw)) return [];
+  const attempts: KeyAttempt[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { index, status, reason } = entry as Record<string, unknown>;
+    if (typeof index !== 'number' || !Number.isFinite(index)) continue;
+    attempts.push({
+      index,
+      ...(typeof status === 'number' ? { status } : {}),
+      ...(typeof reason === 'string' && reason.trim() ? { reason: reason.trim() } : {}),
+    });
+  }
+  return attempts;
+}
+
+/** Reads the key-selection headers off a response. Absent headers mean "single-key server" — no fallback happened. */
+export function readKeyOutcome(response: Response): KeyOutcome {
+  const rawIndex = response.headers.get('x-lyria-key-index');
+  const parsedIndex = rawIndex === null ? NaN : Number(rawIndex);
+  const rawAttempts = response.headers.get('x-lyria-key-attempts');
+  let attempts: KeyAttempt[] = [];
+  if (rawAttempts) {
+    try {
+      attempts = normalizeAttempts(JSON.parse(rawAttempts));
+    } catch {
+      attempts = [];
+    }
+  }
+  return { usedIndex: Number.isFinite(parsedIndex) ? parsedIndex : null, attempts };
+}
+
+/**
+ * Announces a successful request that only succeeded after falling back down the key
+ * list, so the UI can tell the user which key is actually carrying their traffic.
+ * A no-op when the first key worked.
+ */
+export function notifyKeyFallback(response: Response, provider: Provider | null = currentProvider()): KeyOutcome {
+  const outcome = readKeyOutcome(response);
+  if (outcome.attempts.length > 0) {
+    window.dispatchEvent(new CustomEvent<KeyFallbackDetail>(KEY_FALLBACK_EVENT, {
+      detail: { ...outcome, provider },
+    }));
+  }
+  return outcome;
+}
+
+/** Plain-words summary of rejected keys, e.g. "2 keys were rejected: key 1 (429 quota), key 2 (401 invalid)". */
+export function describeKeyAttempts(attempts: KeyAttempt[] | undefined): string {
+  if (!attempts || attempts.length === 0) return '';
+  const parts = attempts.map(a => {
+    const detail = [a.status ? String(a.status) : '', a.reason || ''].filter(Boolean).join(' ');
+    return `key ${a.index + 1}${detail ? ` (${detail})` : ''}`;
+  });
+  const noun = attempts.length === 1 ? '1 key was' : `${attempts.length} keys were`;
+  return `${noun} rejected: ${parts.join(', ')}`;
+}
+
+/** "Used key 2 after key 1 was rejected" — the successful-fallback note. */
+export function describeKeyFallback(detail: KeyOutcome): string {
+  if (!detail.attempts.length) return '';
+  const rejected = detail.attempts.map(a => `key ${a.index + 1}`).join(', ');
+  const verb = detail.attempts.length === 1 ? 'was' : 'were';
+  const used = detail.usedIndex === null ? 'a later key' : `key ${detail.usedIndex + 1}`;
+  return `Used ${used} after ${rejected} ${verb} rejected`;
+}
+
+/** An error from a provider-backed endpoint, carrying the server's per-key rejection list. */
+export class ProviderRequestError extends Error {
+  attempts: KeyAttempt[];
+  status: number;
+  constructor(message: string, attempts: KeyAttempt[], status: number) {
+    super(message);
+    this.name = 'ProviderRequestError';
+    this.attempts = attempts;
+    this.status = status;
+  }
+}
+
+/** Attempts reported alongside an error, whichever shape the caller caught. */
+export function attemptsFromError(err: unknown): KeyAttempt[] {
+  return err instanceof ProviderRequestError ? err.attempts : [];
+}
+
+/** Builds the error for a failed provider-backed response, preferring the body's `attempts` over the headers'. */
+export async function providerFailure(response: Response, fallbackMessage: string): Promise<ProviderRequestError> {
+  const body = await response.json().catch(() => ({} as Record<string, unknown>));
+  const bodyAttempts = normalizeAttempts((body as Record<string, unknown>)?.attempts);
+  const attempts = bodyAttempts.length ? bodyAttempts : readKeyOutcome(response).attempts;
+  const message = typeof (body as Record<string, unknown>)?.error === 'string' && (body as any).error
+    ? (body as any).error as string
+    : fallbackMessage;
+  return new ProviderRequestError(message, attempts, response.status);
+}
+
+/** The provider the user picked in Settings, when they picked one. */
+export function currentProvider(): Provider | null {
+  try {
+    const stored = localStorage.getItem('ai_provider');
+    return stored === 'openrouter' || stored === 'gemini' ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Headers for a provider-backed request: the ordered key lists, plus the legacy
+ * single-key headers (first key only) so an older server still authenticates,
+ * plus the provider choice.
+ */
+export function providerHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const headers = withKeyHeaders({ ...extra });
+  for (const provider of ['gemini', 'openrouter'] as Provider[]) {
+    const first = loadKeys(provider)[0]?.key;
+    if (first) headers[provider === 'gemini' ? 'x-gemini-api-key' : 'x-openrouter-api-key'] = first;
+  }
+  const aiProvider = currentProvider();
+  if (aiProvider) headers['x-ai-provider'] = aiProvider;
+  return headers;
+}
+
+/** GET /api/settings/status — booleans plus (newer servers) how many keys each provider has configured. */
+export interface SettingsStatus {
+  geminiServerKey: boolean;
+  openRouterServerKey: boolean;
+  defaultProvider: 'gemini' | 'openrouter';
+  // Present only on servers that support multiple server-side keys per provider.
+  geminiServerKeys?: number;
+  openRouterServerKeys?: number;
+}
+
 // Real audio analysis, persisted server-side into a generation's manifest once run.
 // One paid call per generation — cached forever once present (see analyzeGeneration below).
 export interface Analysis {
@@ -161,13 +330,7 @@ async function objectUrlToBase64(url: string): Promise<{ mimeType: string; data:
 }
 
 export async function generateVersion(opts: GenerateOptions): Promise<VersionPayload> {
-  const apiKey = localStorage.getItem('gemini_api_key');
-  const openRouterApiKey = localStorage.getItem('openrouter_api_key');
-  const aiProvider = localStorage.getItem('ai_provider');
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['x-gemini-api-key'] = apiKey;
-  if (openRouterApiKey) headers['x-openrouter-api-key'] = openRouterApiKey;
-  if (aiProvider) headers['x-ai-provider'] = aiProvider;
+  const headers = providerHeaders({ 'Content-Type': 'application/json' });
 
   const images = await Promise.all(opts.images.slice(0, 10).map(i => objectUrlToBase64(i.url)));
 
@@ -187,9 +350,9 @@ export async function generateVersion(opts: GenerateOptions): Promise<VersionPay
     }),
   });
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.error || `Generation failed (${response.status})`);
+    throw await providerFailure(response, `Generation failed (${response.status})`);
   }
+  notifyKeyFallback(response);
   return response.json();
 }
 
@@ -203,18 +366,16 @@ export async function listGenerations(): Promise<GenerationEntry[]> {
 }
 
 export async function getOpenRouterCredits(): Promise<{ totalCredits: number; totalUsage: number; balance: number } | null> {
-  const openRouterApiKey = localStorage.getItem('openrouter_api_key');
-  const headers: Record<string, string> = {};
-  if (openRouterApiKey) headers['x-openrouter-api-key'] = openRouterApiKey;
+  const headers = providerHeaders();
 
   const response = await fetch('/api/openrouter/credits', { headers });
   if (response.status === 404) {
     return null;
   }
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.error || `Failed to fetch OpenRouter credits (${response.status})`);
+    throw await providerFailure(response, `Failed to fetch OpenRouter credits (${response.status})`);
   }
+  notifyKeyFallback(response, 'openrouter');
   return response.json();
 }
 
@@ -237,13 +398,7 @@ export async function renameGeneration(id: string, title: string): Promise<Gener
 }
 
 export async function analyzeGeneration(id: string, force = false): Promise<Analysis> {
-  const apiKey = localStorage.getItem('gemini_api_key');
-  const openRouterApiKey = localStorage.getItem('openrouter_api_key');
-  const aiProvider = localStorage.getItem('ai_provider');
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['x-gemini-api-key'] = apiKey;
-  if (openRouterApiKey) headers['x-openrouter-api-key'] = openRouterApiKey;
-  if (aiProvider) headers['x-ai-provider'] = aiProvider;
+  const headers = providerHeaders({ 'Content-Type': 'application/json' });
 
   const response = await fetch('/api/ai/analyze', {
     method: 'POST',
@@ -251,9 +406,9 @@ export async function analyzeGeneration(id: string, force = false): Promise<Anal
     body: JSON.stringify({ id, force }),
   });
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.error || `Analysis failed (${response.status})`);
+    throw await providerFailure(response, `Analysis failed (${response.status})`);
   }
+  notifyKeyFallback(response);
   const data = await response.json();
   return data.analysis;
 }

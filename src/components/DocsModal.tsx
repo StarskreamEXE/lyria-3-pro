@@ -115,7 +115,7 @@ const CHAPTERS: Chapter[] = [
         <H>Quick start</H>
         <UL
           items={[
-            <>Open <Chip>SETTINGS</Chip> (the gear, top right) — pick a provider and add an API key if the server doesn't have one. Generation needs an entitled key either way: a billing-enabled Google key, or an OpenRouter account with credits.</>,
+            <>Open <Chip>SETTINGS</Chip> (the gear, top right) — pick a provider and add an API key if the server doesn't have one. You can add several keys per provider; they are tried in the order listed. Generation needs an entitled key either way: a billing-enabled Google key, or an OpenRouter account with credits.</>,
             <>Write a style prompt in the <Chip>PROMPT</Chip> box. Be technical: genre, BPM, key, vocal character (see Writing Prompts).</>,
             <>Optionally add lyrics in the <Chip>LYRICS</Chip> box under section tags like <Chip>[Verse 1]</Chip> and <Chip>[Chorus]</Chip>.</>,
             <>Pick your model and settings with the <Chip>MODEL</Chip>, <Chip>DUR</Chip> and <Chip>BATCH</Chip> chips next to the GENERATE button.</>,
@@ -540,18 +540,36 @@ rhythmic intensity.`}</CodeBlock>
           refuses audio requests under a <strong>$0.50</strong> balance; it returns MP3 for both Pro and Clip.
         </Note>
         <H>API keys</H>
+        <P>
+          Each provider has its own <strong>ordered list</strong> of keys. Type a key into the field below the list
+          (with an optional label), press <Chip>Add</Chip>, then <Chip>Save Settings</Chip>. Reorder rows with the up
+          and down arrows, remove one with the bin icon. <strong>Position 1 is tried first.</strong>
+        </P>
         <UL
           items={[
-            <>A key entered in Settings is saved in <strong>this browser only</strong> and sent with your requests.</>,
-            <>A browser-saved key always <strong>overrides</strong> the server's configured key.</>,
-            <>Leave a field empty to fall back to the server key (from <Chip>.env.local</Chip>). The status line under each field shows which key is actually in effect.</>,
+            <>Keys entered in Settings are saved in <strong>this browser only</strong> and are tried <strong>before</strong> the server's keys, which stay as fallbacks.</>,
+            <>Store no keys for a provider to use the server's keys (from <Chip>.env.local</Chip>) instead.</>,
+            <>A key's value is <strong>never shown back to you</strong>. A row shows its position, its label and a status — <Chip>Saved</Chip>, <Chip>New</Chip>, <Chip>Moved</Chip> or <Chip>Renamed</Chip>.</>,
+            <>The status line above each list reports counts only, for example <Chip>Browser: 2 keys · Server: 1 key</Chip>, and warns while an edit is unsaved.</>,
+            <>On the server, <Chip>GEMINI_API_KEY=key1,key2</Chip> (commas or newlines) holds a list, and <Chip>GEMINI_API_KEY_2</Chip>, <Chip>_3</Chip>, ... add more. <Chip>OPENROUTER_API_KEY</Chip> works the same way.</>,
           ]}
         />
+        <H>Falling back between keys</H>
+        <P>
+          Keys are tried in order. A key rejected for a reason that belongs to the key — invalid, out of credit, or a
+          quota that allows zero requests — is skipped for the next one down. A <strong>request-level</strong> error
+          (a malformed request, a provider outage) stops there instead of failing over, so nothing is billed twice.
+        </P>
+        <P>
+          After a request that fell back, the cost line under GENERATE says which key carried it, for example{' '}
+          <Chip>Used key 2 after key 1 was rejected</Chip>. If every key fails, the error names each rejected key by
+          position and reason, never by value.
+        </P>
         <H>OpenRouter balance</H>
         <P>
-          With OpenRouter configured, Settings shows your live account balance and an estimate of how many songs/clips
-          it buys. Audio requests need a balance of at least <strong>$0.50</strong> — below that the request is refused
-          up front and nothing is charged.
+          With OpenRouter configured, Settings shows the live account balance of your <strong>first</strong> stored
+          OpenRouter key and an estimate of how many songs/clips it buys. Audio requests need a balance of at least{' '}
+          <strong>$0.50</strong> — below that the request is refused up front and nothing is charged.
         </P>
       </>
     ),

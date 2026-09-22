@@ -25,12 +25,12 @@
 | INSTRUMENTAL tool | One generation with no lyrics and the instrumental directive scoped to that single request. The PROMPT box and the VOCALS toggle are untouched |
 | CHANGE STYLE tool | Opens an input for a **user-typed** style instruction; on submit the line is appended to the PROMPT box and a new version is generated. Nothing is charged until an instruction is submitted |
 | EDIT LYRICS tool | Pure UI: opens and pins the lyrics editor. No request |
-| Cost readout under GENERATE | Real arithmetic: `$0.08 × N` Pro / `$0.04 × N` Clip, plus the live OpenRouter balance when the key can read it |
+| Cost readout under GENERATE | Real arithmetic: `$0.08 × N` Pro / `$0.04 × N` Clip, plus the live OpenRouter balance when the first stored key can read it, and — after a request that fell back — which key carried it (`Used key 2 after key 1 was rejected`) |
 | EXPORT | Downloads the exact bytes on disk for the active version. No conversion, no format chooser. Disabled when the active version has no audio |
 
 ## Provider selection
 
-Settings modal has an AI PROVIDER selector (`GEMINI` \| `OPENROUTER`, persisted to localStorage `ai_provider`) and an OpenRouter API key field (localStorage `openrouter_api_key`), alongside the Gemini key field (`gemini_api_key`). With nothing stored, the selector follows the server's own default.
+Settings modal has an AI PROVIDER selector (`GEMINI` \| `OPENROUTER`, persisted to localStorage `ai_provider`) and, per provider, an **ordered key list** editor — add with an optional label, reorder, remove — persisted to localStorage `gemini_api_keys` / `openrouter_api_keys`. The legacy single-key entries (`gemini_api_key` / `openrouter_api_key`) are migrated into position 1 on first read and kept in step with the first key. With nothing stored, the selector follows the server's own default. Key values are never rendered back: rows show position, label and a `Saved` / `New` / `Moved` / `Renamed` status, and the line above reads `Browser: 2 keys · Server: 1 key`.
 
 **Both generation providers are paid and both have an entitlement requirement.** A Google key needs billing enabled: on the free tier Lyria's quota is 0 requests per day, and generation fails immediately with `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)` — a configuration failure that retrying cannot clear. OpenRouter needs at least $0.50 of account credit for any audio request. The Gemini text helpers and analysis use a different quota and are unaffected. Details in [01 — Provider reality](01-lyria-models.md#provider-reality) and [03](03-api-integration.md#openrouter).
 
@@ -39,10 +39,18 @@ Request headers sent by the client to `/api/ai/modify`, `/api/ai/enhance-prompt`
 | Header | Carries |
 |---|---|
 | `x-ai-provider` | `gemini` or `openrouter` (from localStorage `ai_provider`) |
-| `x-gemini-api-key` | Gemini key from localStorage `gemini_api_key` |
-| `x-openrouter-api-key` | OpenRouter key from localStorage `openrouter_api_key` |
+| `x-gemini-api-keys` | The browser's ordered Gemini keys, comma-separated (localStorage `gemini_api_keys`) |
+| `x-openrouter-api-keys` | The browser's ordered OpenRouter keys, comma-separated (localStorage `openrouter_api_keys`) |
+| `x-gemini-api-key` / `x-openrouter-api-key` | Legacy single-key headers, still accepted after the list headers |
 
-Server precedence: header value > env var (`AI_PROVIDER`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`) > default `gemini`. `.env.example` documents these plus `OPENROUTER_TEXT_MODEL` and `OPENROUTER_ANALYZE_MODEL` (both default `google/gemini-3.5-flash`). Full request/response contract for the OpenRouter path (models, SSE audio parsing, the $0.50 balance gate) is in [03](03-api-integration.md#openrouter).
+Headers the server sends back on those same endpoints:
+
+| Header | Carries |
+|---|---|
+| `x-lyria-key-index` | Zero-based index of the key that was accepted |
+| `x-lyria-key-attempts` | Only when a fallback happened: the rejected keys as index / status / reason — position only, never key material |
+
+Server precedence per provider: list header > legacy single header > `GEMINI_API_KEY` / `OPENROUTER_API_KEY` (each of which may hold a comma- or newline-separated list) > `..._API_KEY_2`, `_3`, ... The resolved list is tried **in order**: a key-level rejection (invalid, out of credit, a quota granting zero requests) moves on to the next key, while a **request-level error does not fail over** — it throws at once so the account is not billed twice. When every key is rejected the endpoint answers `401`, `402`, `429` or `502` with `{ error, attempts }`. Provider precedence is unchanged: `x-ai-provider` > `AI_PROVIDER` > default `gemini`. `/api/settings/status` reports `geminiServerKeys` / `openRouterServerKeys` counts (booleans only otherwise — no key material). `.env.example` documents these plus `OPENROUTER_TEXT_MODEL` and `OPENROUTER_ANALYZE_MODEL` (both default `google/gemini-3.5-flash`). Full request/response contract for the OpenRouter path (models, SSE audio parsing, the $0.50 balance gate) is in [03](03-api-integration.md#openrouter); full key resolution and failover semantics are in [03 — Key management](03-api-integration.md#key-management-in-this-app).
 
 ## Cost by model/provider
 

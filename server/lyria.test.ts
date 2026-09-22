@@ -20,6 +20,8 @@ import { renameGeneration, GenerationNotFoundError } from './lyria';
 import { assertSafeId, InvalidIdError, MissingKeyError, writeJsonAtomic } from './lyria';
 import { mockModifyText, mockEnhancePrompt, buildMockAnalysis } from './lyria';
 import { mapOpenRouterCreditsResponse } from './lyria';
+import { effectiveKeyList, creditsLookupKey, extractErrorStatus, AllKeysFailedError } from './lyria';
+import type { KeyUsage, AnalyzeGenerationCallAiArgs } from './lyria';
 
 const b64 = (s: string) => Buffer.from(s).toString('base64');
 
@@ -2293,5 +2295,477 @@ describe('renameGeneration — embedder chosen from ACTUAL bytes (anti-corruptio
 
     const written = await fs.readFile(path.join(tmpDir, `${id}.wav`));
     expect(written.equals(mystery)).toBe(true); // NEVER rewrite bytes we cannot identify
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-key failover (server/keys.ts contract) through generateLyria and
+// analyzeGeneration. Every provider call below is a stub: no network, no SDK,
+// no real key, never a paid call.
+// ---------------------------------------------------------------------------
+
+/** Two obviously-fake ordered keys. Assertions check these strings never leak into an error. */
+const FAKE_KEYS = ['fake-key-alpha-0000', 'fake-key-beta-1111'];
+
+/** A tiny but fully valid WAV, base64-encoded, standing in for provider-returned audio. */
+const FAKE_AUDIO_B64 = makeMockWav(1).toString('base64');
+
+/** A fake fetch Response carrying one audio delta + [DONE], shaped like OpenRouter's audio SSE. */
+function fakeOpenRouterAudioResponse() {
+  const payload =
+    `data: ${JSON.stringify({ choices: [{ delta: { audio: { data: FAKE_AUDIO_B64, transcript: 'stub transcript' } } }] })}\n\n` +
+    `data: [DONE]\n\n`;
+  const bytes = new TextEncoder().encode(payload);
+  let sent = false;
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => (sent ? { done: true, value: undefined } : ((sent = true), { done: false, value: bytes })),
+      }),
+    },
+  };
+}
+
+/** A fake non-2xx fetch Response; its body text deliberately contains no key material. */
+function fakeOpenRouterErrorResponse(status: number, text: string) {
+  return { ok: false, status, statusText: 'stub', body: null, text: async () => text };
+}
+
+/** Awaits a promise that must reject and returns the thrown value, typed for assertions. */
+async function rejection<T>(pending: Promise<unknown>): Promise<T> {
+  let thrown: unknown;
+  let rejected = false;
+  try {
+    await pending;
+  } catch (error) {
+    thrown = error;
+    rejected = true;
+  }
+  if (!rejected) throw new Error('Expected the promise to reject, but it resolved.');
+  return thrown as T;
+}
+
+/** Sorted listing of a directory, or [] when it does not exist (used to prove nothing was written). */
+async function dirListing(dir: string): Promise<string[]> {
+  try {
+    return (await fs.readdir(dir)).sort();
+  } catch {
+    return [];
+  }
+}
+
+describe('generateLyria — OpenRouter multi-key failover', () => {
+  const GEN_DIR = path.join(process.cwd(), 'generations');
+  const prevMock = process.env.LYRIA_MOCK;
+  let createdId: string | undefined;
+
+  beforeEach(() => {
+    delete process.env.LYRIA_MOCK; // exercise the REAL provider path, with a stubbed fetch
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    if (prevMock === undefined) delete process.env.LYRIA_MOCK;
+    else process.env.LYRIA_MOCK = prevMock;
+    // Remove only the fixture this test created; never touch other generations.
+    if (createdId) {
+      await fs.rm(path.join(GEN_DIR, `${createdId}.wav`), { force: true });
+      await fs.rm(path.join(GEN_DIR, `${createdId}.mp3`), { force: true });
+      await fs.rm(path.join(GEN_DIR, `${createdId}.json`), { force: true });
+      createdId = undefined;
+    }
+  });
+
+  it('first key works: keyUsedIndex 0, no attempts, exactly one provider call', async () => {
+    const fetchMock = vi.fn(async () => fakeOpenRouterAudioResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateLyria(null, { prompt: 'Failover happy path' }, {
+      provider: 'openrouter',
+      openRouterKeys: FAKE_KEYS,
+    });
+    createdId = result.id;
+
+    expect(result.keyUsedIndex).toBe(0);
+    expect(result.keyAttempts).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0] as any)[1].headers.Authorization).toBe(`Bearer ${FAKE_KEYS[0]}`);
+    expect(result.provider).toBe('openrouter');
+  });
+
+  it('first key 429, second works: index 1, one recorded attempt, nothing persisted for the failed attempt', async () => {
+    const before = await dirListing(GEN_DIR);
+
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call++;
+      return call === 1
+        ? fakeOpenRouterErrorResponse(429, 'quota exceeded for this account')
+        : fakeOpenRouterAudioResponse();
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateLyria(null, { prompt: 'Failover to key two' }, {
+      provider: 'openrouter',
+      openRouterKeys: FAKE_KEYS,
+    });
+    createdId = result.id;
+
+    expect(result.keyUsedIndex).toBe(1);
+    expect(result.keyAttempts).toHaveLength(1);
+    expect(result.keyAttempts![0].index).toBe(0);
+    expect(result.keyAttempts![0].status).toBe(429);
+    expect(result.keyAttempts![0].reason).not.toContain(FAKE_KEYS[0]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[1] as any)[1].headers.Authorization).toBe(`Bearer ${FAKE_KEYS[1]}`);
+
+    // Exactly the two files of the ACCEPTED attempt appeared — the rejected attempt wrote nothing.
+    const added = (await dirListing(GEN_DIR)).filter(name => !before.includes(name)).sort();
+    expect(added).toEqual([`${result.id}.json`, `${result.id}.wav`].sort());
+  });
+
+  it('every key rejected (401): AllKeysFailedError, one attempt per key, no key material, nothing persisted', async () => {
+    const before = await dirListing(GEN_DIR);
+
+    const fetchMock = vi.fn(async () => fakeOpenRouterErrorResponse(401, 'invalid api key'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = generateLyria(null, { prompt: 'All keys dead' }, {
+      provider: 'openrouter',
+      openRouterKeys: FAKE_KEYS,
+    });
+    const error = await rejection<AllKeysFailedError>(pending);
+
+    expect(error).toBeInstanceOf(AllKeysFailedError);
+    expect(error.attempts).toHaveLength(2);
+    expect(error.attempts.map(a => a.index)).toEqual([0, 1]);
+    expect(error.attempts.every(a => a.status === 401)).toBe(true);
+    for (const key of FAKE_KEYS) {
+      expect(error.message).not.toContain(key);
+      expect(JSON.stringify(error.attempts)).not.toContain(key);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(await dirListing(GEN_DIR)).toEqual(before);
+  });
+
+  it('a non-key error (500) throws immediately: the second key is never tried', async () => {
+    const before = await dirListing(GEN_DIR);
+
+    const fetchMock = vi.fn(async () => fakeOpenRouterErrorResponse(500, 'upstream exploded'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = generateLyria(null, { prompt: 'Provider outage' }, {
+      provider: 'openrouter',
+      openRouterKeys: FAKE_KEYS,
+    });
+    const error = await rejection<Error>(pending);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(AllKeysFailedError);
+    expect(error.message).toContain('OpenRouter Lyria request failed (500)');
+    expect(fetchMock).toHaveBeenCalledTimes(1); // exactly one attempt — no second key burned
+    expect(await dirListing(GEN_DIR)).toEqual(before);
+  });
+
+  it('legacy single-key option still works and reports index 0', async () => {
+    const fetchMock = vi.fn(async () => fakeOpenRouterAudioResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateLyria(null, { prompt: 'Legacy single key' }, {
+      provider: 'openrouter',
+      openRouterKey: FAKE_KEYS[0],
+    });
+    createdId = result.id;
+
+    expect(result.keyUsedIndex).toBe(0);
+    expect(result.keyAttempts).toEqual([]);
+    expect((fetchMock.mock.calls[0] as any)[1].headers.Authorization).toBe(`Bearer ${FAKE_KEYS[0]}`);
+  });
+
+  it('an explicitly empty key list is the "no key at all" case: MissingKeyError, no provider call', async () => {
+    const fetchMock = vi.fn(async () => fakeOpenRouterAudioResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = generateLyria(null, { prompt: 'No keys' }, { provider: 'openrouter', openRouterKeys: [] });
+    await expect(pending).rejects.toBeInstanceOf(MissingKeyError);
+    await expect(pending).rejects.toThrow('OPENROUTER_API_KEY is not configured. Please add it in the Settings.');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('generateLyria — Gemini multi-key failover', () => {
+  const GEN_DIR = path.join(process.cwd(), 'generations');
+  const prevMock = process.env.LYRIA_MOCK;
+  let createdId: string | undefined;
+
+  const okInteraction = {
+    id: 'interaction-stub-1',
+    steps: [{ type: 'model_output', content: [{ type: 'audio', data: FAKE_AUDIO_B64 }] }],
+  };
+
+  beforeEach(() => {
+    delete process.env.LYRIA_MOCK;
+  });
+
+  afterEach(async () => {
+    if (prevMock === undefined) delete process.env.LYRIA_MOCK;
+    else process.env.LYRIA_MOCK = prevMock;
+    if (createdId) {
+      await fs.rm(path.join(GEN_DIR, `${createdId}.wav`), { force: true });
+      await fs.rm(path.join(GEN_DIR, `${createdId}.json`), { force: true });
+      createdId = undefined;
+    }
+  });
+
+  it('first key 429, second works: a client is built per key and index 1 is reported', async () => {
+    const usedKeys: string[] = [];
+    const factory = (apiKey: string) => ({
+      interactions: {
+        create: async () => {
+          usedKeys.push(apiKey);
+          if (apiKey === FAKE_KEYS[0]) throw Object.assign(new Error('Quota exceeded'), { status: 429 });
+          return okInteraction;
+        },
+      },
+    });
+
+    const result = await generateLyria(factory, { prompt: 'Gemini failover' }, { geminiKeys: FAKE_KEYS });
+    createdId = result.id;
+
+    expect(usedKeys).toEqual(FAKE_KEYS);
+    expect(result.keyUsedIndex).toBe(1);
+    expect(result.keyAttempts).toHaveLength(1);
+    expect(result.keyAttempts![0]).toMatchObject({ index: 0, status: 429 });
+    expect(result.interactionId).toBe('interaction-stub-1');
+  });
+
+  it('derives the status from an SDK error that only carries it inside the message body', async () => {
+    const before = await dirListing(GEN_DIR);
+    const create = vi.fn(async () => {
+      throw new Error('{"error":{"code":429,"message":"You exceeded your current quota"}}');
+    });
+    const factory = () => ({ interactions: { create } });
+
+    const pending = generateLyria(factory, { prompt: 'Free tier grants zero' }, { geminiKeys: FAKE_KEYS });
+    const error = await rejection<AllKeysFailedError>(pending);
+
+    expect(error).toBeInstanceOf(AllKeysFailedError);
+    expect(error.attempts.map(a => a.status)).toEqual([429, 429]); // classified, not guessed
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(await dirListing(GEN_DIR)).toEqual(before);
+  });
+
+  it('a non-key Gemini error (500) throws immediately without trying the second key', async () => {
+    const create = vi.fn(async () => {
+      throw Object.assign(new Error('internal error'), { status: 500 });
+    });
+    const factory = () => ({ interactions: { create } });
+
+    await expect(
+      generateLyria(factory, { prompt: 'Gemini outage' }, { geminiKeys: FAKE_KEYS }),
+    ).rejects.toThrow('internal error');
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('a prebuilt client with no key fields keeps working (legacy server.ts contract)', async () => {
+    const create = vi.fn(async () => okInteraction);
+    const result = await generateLyria({ interactions: { create } }, { prompt: 'Legacy prebuilt client' });
+    createdId = result.id;
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(result.keyUsedIndex).toBe(0);
+    expect(result.keyAttempts).toEqual([]);
+  });
+
+  it('no client and no keys is the "no key at all" case: MissingKeyError', async () => {
+    const pending = generateLyria(null, { prompt: 'Nothing configured' });
+    await expect(pending).rejects.toBeInstanceOf(MissingKeyError);
+    await expect(pending).rejects.toThrow('GEMINI_API_KEY is not configured. Please add it in the Settings.');
+  });
+});
+
+describe('analyzeGeneration — multi-key failover', () => {
+  let tmpDir: string;
+  const prevMock = process.env.LYRIA_MOCK;
+
+  const analysisJson = JSON.stringify({
+    title: 'Stub Analysis',
+    genre: 'Ambient',
+    mood: 'Calm',
+    energy: 20,
+    bpm: null,
+    key: null,
+    instrumentation: [],
+    sections: [],
+    notes: '',
+  });
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'lyria-failover-analyze-'));
+    delete process.env.LYRIA_MOCK;
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    if (prevMock === undefined) delete process.env.LYRIA_MOCK;
+    else process.env.LYRIA_MOCK = prevMock;
+  });
+
+  async function seed(id: string): Promise<void> {
+    const manifest: GenerationManifest = {
+      id,
+      model: 'lyria-3-pro-preview',
+      format: 'wav',
+      provider: 'mock',
+      prompt: 'seeded prompt',
+      lyrics: '',
+      generatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await fs.writeFile(path.join(tmpDir, `${id}.json`), JSON.stringify(manifest), 'utf8');
+    await fs.writeFile(path.join(tmpDir, `${id}.wav`), Buffer.from('fake audio'), 'utf8');
+  }
+
+  it('passes the first key and reports index 0 with no attempts', async () => {
+    const id = 'gen-100-failover1';
+    await seed(id);
+    const callAi = vi.fn(async (_args: AnalyzeGenerationCallAiArgs) => analysisJson);
+    const usage: KeyUsage[] = [];
+
+    const analysis = await analyzeGeneration({
+      id, dir: tmpDir, callAi, geminiKeys: FAKE_KEYS, onKeyUsage: u => usage.push(u),
+    });
+
+    expect(analysis.title).toBe('Stub Analysis');
+    expect(callAi).toHaveBeenCalledTimes(1);
+    expect(callAi.mock.calls[0][0].apiKey).toBe(FAKE_KEYS[0]);
+    expect(usage).toEqual([{ keyUsedIndex: 0, keyAttempts: [] }]);
+  });
+
+  it('fails over to the second key on 429 and persists only the accepted attempt', async () => {
+    const id = 'gen-101-failover2';
+    await seed(id);
+    const callAi = vi.fn(async ({ apiKey }: { apiKey?: string }) => {
+      if (apiKey === FAKE_KEYS[0]) throw Object.assign(new Error('rate limited'), { status: 429 });
+      return analysisJson;
+    });
+    const usage: KeyUsage[] = [];
+
+    const analysis = await analyzeGeneration({
+      id, dir: tmpDir, callAi, geminiKeys: FAKE_KEYS, onKeyUsage: u => usage.push(u),
+    });
+
+    expect(analysis.title).toBe('Stub Analysis');
+    expect(callAi).toHaveBeenCalledTimes(2);
+    expect(usage[0].keyUsedIndex).toBe(1);
+    expect(usage[0].keyAttempts).toHaveLength(1);
+    expect(usage[0].keyAttempts[0]).toMatchObject({ index: 0, status: 429 });
+
+    const persisted = JSON.parse(await fs.readFile(path.join(tmpDir, `${id}.json`), 'utf8'));
+    expect(persisted.analysis.title).toBe('Stub Analysis'); // written once, by the accepted attempt
+  });
+
+  it('every key rejected: AllKeysFailedError, one attempt per key, no key material, nothing persisted', async () => {
+    const id = 'gen-102-failover3';
+    await seed(id);
+    const callAi = vi.fn(async () => {
+      throw Object.assign(new Error('invalid api key'), { status: 401 });
+    });
+
+    const pending = analyzeGeneration({ id, dir: tmpDir, callAi, openRouterKeys: FAKE_KEYS, provider: 'openrouter' });
+    const error = await rejection<AllKeysFailedError>(pending);
+
+    expect(error).toBeInstanceOf(AllKeysFailedError);
+    expect(error.attempts).toHaveLength(2);
+    expect(callAi).toHaveBeenCalledTimes(2);
+    for (const key of FAKE_KEYS) {
+      expect(error.message).not.toContain(key);
+      expect(JSON.stringify(error.attempts)).not.toContain(key);
+    }
+    const persisted = JSON.parse(await fs.readFile(path.join(tmpDir, `${id}.json`), 'utf8'));
+    expect(persisted.analysis).toBeUndefined();
+  });
+
+  it('a non-key error throws immediately: the second key is never tried', async () => {
+    const id = 'gen-103-failover4';
+    await seed(id);
+    const callAi = vi.fn(async () => {
+      throw Object.assign(new Error('provider outage'), { status: 500 });
+    });
+
+    await expect(
+      analyzeGeneration({ id, dir: tmpDir, callAi, geminiKeys: FAKE_KEYS }),
+    ).rejects.toThrow('provider outage');
+    expect(callAi).toHaveBeenCalledTimes(1);
+  });
+
+  it('legacy callers that pass no key fields keep the original single-call behavior', async () => {
+    const id = 'gen-104-legacy';
+    await seed(id);
+    const callAi = vi.fn(async (_args: AnalyzeGenerationCallAiArgs) => analysisJson);
+
+    const analysis = await analyzeGeneration({ id, dir: tmpDir, callAi });
+
+    expect(analysis.title).toBe('Stub Analysis');
+    expect(callAi).toHaveBeenCalledTimes(1);
+    expect(callAi.mock.calls[0][0].apiKey).toBeUndefined(); // callAi resolves its own key, as before
+  });
+
+  it('legacy single-key option is used when no list is supplied', async () => {
+    const id = 'gen-105-legacysingle';
+    await seed(id);
+    const callAi = vi.fn(async (_args: AnalyzeGenerationCallAiArgs) => analysisJson);
+
+    await analyzeGeneration({ id, dir: tmpDir, callAi, openRouterKey: FAKE_KEYS[1], provider: 'openrouter' });
+
+    expect(callAi.mock.calls[0][0].apiKey).toBe(FAKE_KEYS[1]);
+  });
+
+  it('an explicitly empty list is the "no key at all" case: MissingKeyError, no provider call', async () => {
+    const id = 'gen-106-emptylist';
+    await seed(id);
+    const callAi = vi.fn(async (_args: AnalyzeGenerationCallAiArgs) => analysisJson);
+
+    await expect(
+      analyzeGeneration({ id, dir: tmpDir, callAi, geminiKeys: [] }),
+    ).rejects.toBeInstanceOf(MissingKeyError);
+    expect(callAi).not.toHaveBeenCalled();
+  });
+});
+
+describe('effectiveKeyList / creditsLookupKey / extractErrorStatus', () => {
+  it('prefers the list, falls back to the legacy single key, else empty', () => {
+    expect(effectiveKeyList(['a', 'b'], 'legacy')).toEqual(['a', 'b']);
+    expect(effectiveKeyList(undefined, 'legacy')).toEqual(['legacy']);
+    expect(effectiveKeyList(undefined, undefined)).toEqual([]);
+    expect(effectiveKeyList([], 'legacy')).toEqual([]); // an explicit empty list is not overridden
+  });
+
+  it('drops blank entries so an empty string is never sent as a credential', () => {
+    expect(effectiveKeyList(['a', '', '   ', 'b'])).toEqual(['a', 'b']);
+    expect(effectiveKeyList(undefined, '   ')).toEqual([]);
+  });
+
+  it('creditsLookupKey takes the FIRST key only (a read-only balance check never fails over)', () => {
+    expect(creditsLookupKey(['first', 'second'])).toBe('first');
+    expect(creditsLookupKey(undefined, 'legacy')).toBe('legacy');
+    expect(creditsLookupKey([])).toBeUndefined();
+    expect(creditsLookupKey(undefined, undefined)).toBeUndefined();
+  });
+
+  it('extractErrorStatus reads the SDK status, nested codes, or an unambiguous message code', () => {
+    expect(extractErrorStatus({ status: 429 })).toBe(429);
+    expect(extractErrorStatus({ statusCode: 402 })).toBe(402);
+    expect(extractErrorStatus({ error: { code: 403 } })).toBe(403);
+    expect(extractErrorStatus({ response: { status: 401 } })).toBe(401);
+    expect(extractErrorStatus(new Error('{"error":{"code":429}}'))).toBe(429);
+    expect(extractErrorStatus(new Error('got status: 503'))).toBe(503);
+  });
+
+  it('extractErrorStatus returns undefined rather than guessing from a loose number', () => {
+    expect(extractErrorStatus(new Error('generated 429 samples'))).toBeUndefined();
+    expect(extractErrorStatus(new Error('network down'))).toBeUndefined();
+    expect(extractErrorStatus(undefined)).toBeUndefined();
   });
 });

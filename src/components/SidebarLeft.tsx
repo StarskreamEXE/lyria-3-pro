@@ -1,6 +1,18 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Box, Image as ImageIcon, AudioLines, Sparkles, Command, Maximize2, MoveVertical, ChevronRight, ArrowUpDown, ChevronDown, ChevronUp, Pin, X, Undo, Redo, Loader2 } from 'lucide-react';
-import { generateVersion, getOpenRouterCredits, type Project } from '../lib/lyriaClient';
+import {
+  generateVersion,
+  getOpenRouterCredits,
+  providerHeaders,
+  providerFailure,
+  notifyKeyFallback,
+  describeKeyAttempts,
+  describeKeyFallback,
+  attemptsFromError,
+  KEY_FALLBACK_EVENT,
+  type KeyFallbackDetail,
+  type Project,
+} from '../lib/lyriaClient';
 import { projectStore } from '../lib/projectStore';
 
 // Real per-track prices shown in the MODEL dropdown — mirrors costPerUnit's mapping
@@ -117,6 +129,9 @@ export function SidebarLeft() {
   // from one click don't collide on the same name.
   const [trackName, setTrackName] = useState('');
   const [openRouterBalance, setOpenRouterBalance] = useState<number | null>(null);
+  // "Used key 2 after key 1 was rejected" — set from the `lyria-key-fallback` event,
+  // cleared when the next generation starts. Never holds key material.
+  const [keyFallbackNote, setKeyFallbackNote] = useState('');
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
@@ -281,6 +296,20 @@ export function SidebarLeft() {
     refreshOpenRouterBalance();
   }, []);
 
+  // A request that only succeeded after the server fell past one or more stored keys
+  // announces itself on `lyria-key-fallback`. Surface it as a one-line note on the
+  // cost readout under GENERATE so the user knows which key is carrying their traffic;
+  // it is replaced (or cleared) by the next request. Indexes only — never key values.
+  useEffect(() => {
+    const handleFallback = (e: Event) => {
+      const detail = (e as CustomEvent<KeyFallbackDetail>).detail;
+      if (!detail) return;
+      setKeyFallbackNote(describeKeyFallback(detail));
+    };
+    window.addEventListener(KEY_FALLBACK_EVENT, handleFallback);
+    return () => window.removeEventListener(KEY_FALLBACK_EVENT, handleFallback);
+  }, []);
+
   // Shared reseed logic used by both the project-load handler (below) and the
   // 'lyria-load-params' handler (right-click "Load with settings" from history/version
   // tabs — see the effect further down). Reapplies prompt/lyrics (reseeding both undo/redo
@@ -390,6 +419,9 @@ export function SidebarLeft() {
   const handleGenerate = async (genOpts?: { forceInstrumental?: boolean }) => {
     if (isGeneratingRef.current) return;
     isGeneratingRef.current = true;
+    // The previous run's key-fallback note describes a finished request; drop it so
+    // it can't be mistaken for this one's outcome.
+    setKeyFallbackNote('');
 
     try {
       let currentPrompt = promptRef.current;
@@ -399,19 +431,7 @@ export function SidebarLeft() {
         setIsPromptAiLoading(true);
         isPromptAiLoadingRef.current = true;
         try {
-          const apiKey = localStorage.getItem('gemini_api_key');
-          const openRouterApiKey = localStorage.getItem('openrouter_api_key');
-          const aiProvider = localStorage.getItem('ai_provider');
-          const headers: Record<string, string> = { "Content-Type": "application/json" };
-          if (apiKey) {
-            headers['x-gemini-api-key'] = apiKey;
-          }
-          if (openRouterApiKey) {
-            headers['x-openrouter-api-key'] = openRouterApiKey;
-          }
-          if (aiProvider) {
-            headers['x-ai-provider'] = aiProvider;
-          }
+          const headers = providerHeaders({ "Content-Type": "application/json" });
 
           const response = await fetch("/api/ai/enhance-prompt", {
             method: "POST",
@@ -419,6 +439,7 @@ export function SidebarLeft() {
             body: JSON.stringify({ prompt: currentPrompt })
           });
           if (response.ok) {
+            notifyKeyFallback(response);
             const data = await response.json();
             if (data.result) {
               currentPrompt = data.result;
@@ -428,8 +449,11 @@ export function SidebarLeft() {
               updatePromptWithHistory(currentPrompt);
             }
           } else {
-            const errData = await response.json().catch(() => ({}));
-            const errMsg = errData.error || "Unknown error";
+            const failure = await providerFailure(response, "Unknown error");
+            // Plain-words per-key rejection summary (never key values), appended to the
+            // single alert below so a user with several keys can see which ones failed.
+            const keySummary = describeKeyAttempts(failure.attempts);
+            const errMsg = keySummary ? `${failure.message} — ${keySummary}` : failure.message;
             console.error("Enhancement failed on server:", errMsg);
             // AUTO promised an enhanced prompt — on failure, ABORT instead of
             // silently spending on the un-enhanced prompt (surprise spend).
@@ -469,13 +493,7 @@ export function SidebarLeft() {
         setIsLyricsAiLoading(true);
         isLyricsAiLoadingRef.current = true;
         try {
-          const apiKey = localStorage.getItem('gemini_api_key');
-          const openRouterApiKey = localStorage.getItem('openrouter_api_key');
-          const aiProvider = localStorage.getItem('ai_provider');
-          const headers: Record<string, string> = { "Content-Type": "application/json" };
-          if (apiKey) headers['x-gemini-api-key'] = apiKey;
-          if (openRouterApiKey) headers['x-openrouter-api-key'] = openRouterApiKey;
-          if (aiProvider) headers['x-ai-provider'] = aiProvider;
+          const headers = providerHeaders({ "Content-Type": "application/json" });
 
           const response = await fetch("/api/ai/modify", {
             method: "POST",
@@ -487,14 +505,18 @@ export function SidebarLeft() {
             })
           });
           if (response.ok) {
+            notifyKeyFallback(response);
             const data = await response.json();
             if (data.result) {
               currentLyrics = data.result;
               updateLyricsWithHistory(currentLyrics);
             }
           } else {
-            const errData = await response.json().catch(() => ({}));
-            console.error("Auto-lyrics failed on server:", errData.error || "Unknown error");
+            // Console-only by design (auto-lyrics is best-effort and must not stack an
+            // alert onto the generation flow), but the key rejections go in the log too.
+            const failure = await providerFailure(response, "Unknown error");
+            const keySummary = describeKeyAttempts(failure.attempts);
+            console.error("Auto-lyrics failed on server:", keySummary ? `${failure.message} — ${keySummary}` : failure.message);
           }
         } catch (err) {
           console.error("Error auto-writing lyrics:", err);
@@ -535,7 +557,18 @@ export function SidebarLeft() {
         window.dispatchEvent(new CustomEvent('lyria-generated', { detail: { count: 1, payload: r.value } }));
       });
       if (failed > 0) {
-        alert(`${failed} of ${results.length} generation(s) failed. Check your API key in Settings or the server console.`);
+        // One alert for the whole batch (never one per version). When the server fell
+        // through several keys, name which ones it rejected — indexes and statuses only,
+        // never key values. All failures in a batch share the same key list, so the first
+        // rejection's summary describes them all.
+        const rejected = results.filter(r => r.status === 'rejected') as PromiseRejectedResult[];
+        const keySummary = rejected
+          .map(r => describeKeyAttempts(attemptsFromError(r.reason)))
+          .find(Boolean) ?? '';
+        alert(
+          `${failed} of ${results.length} generation(s) failed. Check your API key in Settings or the server console.`
+          + (keySummary ? `\n\n${keySummary}` : '')
+        );
       }
       refreshOpenRouterBalance();
     } finally {
@@ -912,19 +945,7 @@ export function SidebarLeft() {
     }
 
     try {
-      const apiKey = localStorage.getItem('gemini_api_key');
-      const openRouterApiKey = localStorage.getItem('openrouter_api_key');
-      const aiProvider = localStorage.getItem('ai_provider');
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (apiKey) {
-        headers['x-gemini-api-key'] = apiKey;
-      }
-      if (openRouterApiKey) {
-        headers['x-openrouter-api-key'] = openRouterApiKey;
-      }
-      if (aiProvider) {
-        headers['x-ai-provider'] = aiProvider;
-      }
+      const headers = providerHeaders({ "Content-Type": "application/json" });
 
       const response = await fetch("/api/ai/modify", {
         method: "POST",
@@ -938,16 +959,14 @@ export function SidebarLeft() {
       });
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        const errMsg = typeof errData.error === 'string' && errData.error
-          ? errData.error
-          : 'AI refinement request failed.';
         // Do NOT alert here: the catch below is the single error surface for this
         // call, so a server-side failure shows exactly one dialog (it used to show
-        // this one AND the generic one from the catch, stacked).
-        throw new Error(errMsg);
+        // this one AND the generic one from the catch, stacked). The thrown
+        // ProviderRequestError carries the per-key rejections for that one alert.
+        throw await providerFailure(response, 'AI refinement request failed.');
       }
 
+      notifyKeyFallback(response);
       const data = await response.json();
       const aiResult = data.result || "";
 
@@ -971,9 +990,11 @@ export function SidebarLeft() {
       // One alert per failure, carrying the real reason — never swallowed, never
       // stacked. The console keeps the full error for debugging.
       console.error('AI refinement failed:', err);
-      const errMsg = err instanceof Error && err.message
+      const keySummary = describeKeyAttempts(attemptsFromError(err));
+      const baseMsg = err instanceof Error && err.message
         ? err.message
         : 'AI refinement request failed.';
+      const errMsg = keySummary ? `${baseMsg} — ${keySummary}` : baseMsg;
       if (errMsg.includes('Lightning dunning') || errMsg.includes('leaked')) {
         alert('API Key Error: ' + errMsg + '\n\nPlease click the Settings button INSIDE THIS APP (the gear icon) to add your own custom Gemini API Key.');
       } else {
@@ -1527,6 +1548,9 @@ export function SidebarLeft() {
             <span className={openRouterBalance < 0.5 ? 'text-lyria-signal' : ''}>
               {` · bal $${openRouterBalance.toFixed(2)} (≈${Math.floor(openRouterBalance / costPerUnit)} left)`}
             </span>
+          )}
+          {keyFallbackNote && (
+            <span className="text-lyria-gold/80">{` · ${keyFallbackNote}`}</span>
           )}
         </span>
       </div>

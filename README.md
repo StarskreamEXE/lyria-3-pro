@@ -21,7 +21,7 @@ Describe a song, get a finished, fully arranged track: vocals, instruments, stru
 ![Tailwind](https://img.shields.io/badge/Tailwind-v4-d6b485?style=flat-square&logo=tailwindcss&logoColor=white&labelColor=0d0a08)
 ![Vite](https://img.shields.io/badge/Vite-6-d6b485?style=flat-square&logo=vite&logoColor=white&labelColor=0d0a08)
 ![Express](https://img.shields.io/badge/Express-4-d6b485?style=flat-square&logo=express&logoColor=white&labelColor=0d0a08)
-![Tests](https://img.shields.io/badge/tests-218%20passing-d6b485?style=flat-square&logo=vitest&logoColor=white&labelColor=0d0a08)
+![Tests](https://img.shields.io/badge/tests-315%20passing-d6b485?style=flat-square&logo=vitest&logoColor=white&labelColor=0d0a08)
 
 [Features](#features) · [Quick Start](#quick-start) · [User Guide](docs/USER_GUIDE.md) · [Providers](#providers) · [Configuration](#configuration) · [Architecture](#architecture) · [API](#api)
 
@@ -90,6 +90,8 @@ Both providers are wired for generation, the AI text helpers and analysis, and b
 - **OpenRouter** needs credits on the account. It refuses any audio request while the balance is under **$0.50**, and refuses before generating, so a refused request is not billed. Both Pro and Clip return **MP3**, stereo 44.1 kHz. Settings shows your live balance and roughly how many tracks it covers when the key is allowed to read OpenRouter's credits endpoint (a plain inference key may not be; the balance line is then simply absent, and generation still works).
 - **Gemini** needs a **billing-enabled** Google API key. Google's free tier grants **zero Lyria requests per day**, so a free-tier key fails the generation request immediately with `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)`. That is a quota wall rather than a transient rate limit — retrying never clears it. Enable billing on the key, or use OpenRouter. The Gemini text helpers and analysis are unaffected by that quota.
 
+You can store **several keys per provider**, in priority order, and the app walks the list: a key rejected because of the key itself (invalid, out of credit, or a quota that grants zero requests) is skipped for the next one, while a request-level error stops immediately so nothing is billed twice.
+
 Google documents a WAV response path for Lyria 3 Pro (`response_format: { type: "audio" }`), and the app asks for it on the Pro path. It never trusts the answer: the audio format is detected from the returned bytes, and that detected format is what lands on disk, in the manifest and in EXPORT.
 
 ## Tour
@@ -127,7 +129,7 @@ Google documents a WAV response path for Lyria 3 Pro (`response_format: { type: 
 </tr>
 <tr>
 <td><b>Docs.</b> A full prompting and model guide, inside the app.</td>
-<td><b>Settings.</b> Choose Gemini or OpenRouter and manage keys. The status line reports only whether a key is saved, never any key material.</td>
+<td><b>Settings.</b> Choose Gemini or OpenRouter and manage each provider's ordered key list — add, label, reorder, remove. The status line reports only how many keys are stored, for example <code>Browser: 2 keys · Server: 1 key</code>, never any key material.</td>
 </tr>
 </table>
 
@@ -143,8 +145,8 @@ All variables go in `.env.local` (git-ignored). Real environment variables overr
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GEMINI_API_KEY` | — | Google Gemini API key (generation, AI assist, analysis). |
-| `OPENROUTER_API_KEY` | — | OpenRouter API key (same features, via OpenRouter). |
+| `GEMINI_API_KEY` | — | Google Gemini API key (generation, AI assist, analysis). Accepts several keys separated by commas or newlines, tried in the order written. `GEMINI_API_KEY_2`, `_3`, ... are appended after it if you prefer one key per line. |
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (same features, via OpenRouter). Same list and `OPENROUTER_API_KEY_2`, `_3`, ... numbered forms. |
 | `AI_PROVIDER` | `gemini` | Server-side default provider: `gemini` or `openrouter`. The in-app Settings choice overrides it per browser. |
 | `OPENROUTER_TEXT_MODEL` | `google/gemini-3.5-flash` | Text model for the wand / AUTO helpers on OpenRouter. |
 | `OPENROUTER_ANALYZE_MODEL` | `google/gemini-3.5-flash` | Model used for audio analysis on OpenRouter. |
@@ -152,7 +154,7 @@ All variables go in `.env.local` (git-ignored). Real environment variables overr
 | `PORT` | `3001` | Server port. |
 | `DISABLE_HMR` | off | `true` disables Vite hot-reload and file watching. |
 
-Keys entered in **Settings** are kept in the browser's `localStorage` and sent as request headers. They take precedence over the server's keys. The server never returns key material to the browser, only whether a key is configured.
+Keys entered in **Settings** are kept in the browser's `localStorage` and sent as request headers. They are tried before the server's keys, which remain as fallbacks rather than being ignored. The server never returns key material to the browser, only how many keys it holds per provider.
 
 ## Architecture
 
@@ -205,8 +207,10 @@ Generated audio lands in `generations/` and projects in `projects/`. Both are lo
 | `GET` `POST` | `/api/projects` | List / create projects. |
 | `PUT` | `/api/projects/:id` | Update a project. |
 | `POST` | `/api/projects/:id/archive` | Archive a project (moved to `projects/archived/`, never deleted). |
-| `GET` | `/api/openrouter/credits` | Live OpenRouter balance, when the key can read it. |
-| `GET` | `/api/settings/status` | Which keys the server has (booleans only) and the default provider. |
+| `GET` | `/api/openrouter/credits` | Live OpenRouter balance for the first stored OpenRouter key, when that key can read it. |
+| `GET` | `/api/settings/status` | How many keys the server holds per provider (`geminiServerKeys` / `openRouterServerKeys`, plus the existing booleans) and the default provider. Never any key material. |
+
+Requests carry their keys in `x-gemini-api-keys` / `x-openrouter-api-keys` — the browser's ordered list, comma-separated; the single-key `x-gemini-api-key` / `x-openrouter-api-key` headers still work. A successful response reports which key was used in `x-lyria-key-index` and, when it had to fall back, the rejected ones in `x-lyria-key-attempts` (position and reason only). When every key is rejected the response is `401`, `402`, `429` or `502` with `{ error, attempts }`.
 
 Generated audio is served as static files under `/generations`, with byte-range requests supported for seeking.
 
@@ -218,7 +222,7 @@ Generated audio is served as static files under `/generations`, with byte-range 
 | `npm run build` | Build the SPA and bundle the server to `dist/server.cjs`. |
 | `npm run start` | Run the production bundle. |
 | `npm run lint` | Type-check (`tsc --noEmit`). |
-| `npm test` | Run the Vitest suite (218 tests). |
+| `npm test` | Run the Vitest suite (315 tests). |
 
 ## Cost & limits
 

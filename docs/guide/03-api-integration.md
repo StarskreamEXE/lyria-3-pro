@@ -125,11 +125,28 @@ The per-generation manifest JSON (fields listed under [Cost & batching](#cost--b
 
 Server (`server.ts`) resolves the **provider** as: `x-ai-provider` request header (user-provided via Settings modal → localStorage `ai_provider`) → `AI_PROVIDER` env var → default `gemini`.
 
-Per-provider keys follow the same header-over-env precedence:
+Per-provider keys are an **ordered list**, not a single value, and the same header-over-env precedence decides the order. Resolution for one provider, highest priority first (`resolveKeys` in `server/keys.ts`):
 
-- Gemini: `x-gemini-api-key` request header (Settings modal → localStorage `gemini_api_key`) → `GEMINI_API_KEY` in `.env.local`.
-- OpenRouter: `x-openrouter-api-key` request header (Settings modal → localStorage `openrouter_api_key`) → `OPENROUTER_API_KEY` in `.env.local`.
+1. `x-gemini-api-keys` / `x-openrouter-api-keys` — the browser's ordered list, comma or newline separated (Settings modal → localStorage `gemini_api_keys` / `openrouter_api_keys`).
+2. `x-gemini-api-key` / `x-openrouter-api-key` — the legacy single-key headers, still accepted.
+3. `GEMINI_API_KEY` / `OPENROUTER_API_KEY` in `.env.local`, which may themselves hold a comma- or newline-separated list.
+4. `GEMINI_API_KEY_2`, `_3`, ... / `OPENROUTER_API_KEY_2`, `_3`, ... for one key per line.
 
-`.env.example` documents both providers' env vars, including `OPENROUTER_TEXT_MODEL` and `OPENROUTER_ANALYZE_MODEL` (both default `google/gemini-3.5-flash`). Any future generation endpoint must follow the same precedence.
+Blanks, duplicates and the `.env.example` placeholders are dropped. Browser keys therefore still override the server's, while the server's remain as fallbacks rather than being discarded.
 
-Note that the server-side default provider is `gemini`. A user whose `AI_PROVIDER` is unset, who has not chosen in Settings, and whose Google key is on the free tier will hit the 0-requests-per-day 429 described above on their first generation. Point them at a billing-enabled Google key, or at OpenRouter with credit on the account.
+**Failover semantics** (`withKeyFailover` in `server/keys.ts`): each key is tried in order, and only a **key-fault** error moves to the next one — 401/402/403/429, or a message naming an invalid key, a quota, insufficient credit or billing. Google's zero-requests-per-day free tier is the case this exists for. **Request-level errors do not fail over**: a malformed request or a provider outage throws at once, because retrying it on another key would only repeat the failure and can bill the account twice.
+
+Reporting, all key-free:
+
+| Surface | Carries |
+|---|---|
+| `x-lyria-key-index` response header | Zero-based index of the key that was accepted |
+| `x-lyria-key-attempts` response header | Present only when a fallback happened: the rejected attempts as `index` / `status` / `reason` |
+| Error body | `{ error, attempts }` with `401`, `402`, `429` or `502` when every key is rejected |
+| `GET /api/settings/status` | `geminiServerKeys` / `openRouterServerKeys` counts alongside the existing booleans |
+
+Attempts are identified by position only; no key material, not even a fragment, ever leaves the server.
+
+`.env.example` documents both providers' env vars, including `OPENROUTER_TEXT_MODEL` and `OPENROUTER_ANALYZE_MODEL` (both default `google/gemini-3.5-flash`). Any future generation endpoint must follow the same precedence and the same failover rule.
+
+Note that the server-side default provider is `gemini`. A user whose `AI_PROVIDER` is unset, who has not chosen in Settings, and whose Google key is on the free tier will hit the 0-requests-per-day 429 described above on their first generation — and, if a billing-enabled key sits later in the list, the failover will skip past the free-tier key to it automatically. With no such key configured, point them at a billing-enabled Google key, or at OpenRouter with credit on the account.

@@ -621,6 +621,13 @@ export function detectAudioFormat(buf: Buffer): 'wav' | 'mp3' | 'unknown' {
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { withKeyFailover } from './keys';
+import type { KeyAttempt } from './keys';
+
+// Re-exported so server.ts (and any other consumer already importing from this module) can map
+// the all-keys-rejected case and type the attempt list without a second import path.
+export { AllKeysFailedError } from './keys';
+export type { KeyAttempt } from './keys';
 
 // ---------------------------------------------------------------------------
 // Shared id validation + atomic JSON persistence (used by lyria.ts, projects.ts, server.ts)
@@ -693,6 +700,13 @@ export interface GenerateResult {
   structure?: unknown;
   title?: string;
   durationSeconds?: number;
+  /**
+   * Index, in the ordered key list for the provider, of the key that was accepted. Present only
+   * on the real provider paths: mock mode uses no key at all and reports neither field.
+   */
+  keyUsedIndex?: number;
+  /** Keys rejected before the accepted one, in order. Empty array when the first key worked. */
+  keyAttempts?: KeyAttempt[];
 }
 
 /** Fields actually written to a generation manifest JSON file. */
@@ -785,7 +799,97 @@ export class LyriaValidationError extends Error {}
 
 export interface GenerateLyriaSource {
   provider?: 'gemini' | 'openrouter';
+  /** Legacy single OpenRouter key. Used only when `openRouterKeys` is not supplied. */
   openRouterKey?: string;
+  /** Legacy single Gemini key. Used only when `geminiKeys` is not supplied. */
+  geminiKey?: string;
+  /** Ordered OpenRouter keys; walked in order, advancing only on a key fault. */
+  openRouterKeys?: string[];
+  /** Ordered Gemini keys; walked in order, advancing only on a key fault. */
+  geminiKeys?: string[];
+}
+
+/**
+ * Builds the effective ordered key list for one provider: the list when the caller supplied one
+ * (even an empty one — an explicit "no keys" is not silently replaced by the legacy field), else
+ * the legacy single key, else empty. Blank/whitespace entries are dropped so a stray empty string
+ * from a split env var can never be sent to a provider as a credential.
+ */
+export function effectiveKeyList(list: string[] | undefined, legacyKey?: string): string[] {
+  if (list !== undefined) {
+    return list.filter((key): key is string => typeof key === 'string' && key.trim().length > 0);
+  }
+  return typeof legacyKey === 'string' && legacyKey.trim() ? [legacyKey] : [];
+}
+
+/**
+ * The key used for the read-only OpenRouter credits lookup: the FIRST configured key. A balance
+ * read spends nothing and cannot be "fixed" by another key — a 403/404 there only means this key
+ * has no balance readout (the credits endpoint needs a management key) — so it deliberately does
+ * not fail over. Returns undefined when nothing is configured, i.e. "no balance readout".
+ */
+export function creditsLookupKey(keys?: string[], legacyKey?: string): string | undefined {
+  return effectiveKeyList(keys, legacyKey)[0];
+}
+
+/** Builds an Error carrying a numeric HTTP `status`, which is what isKeyFault() classifies on. */
+function errorWithStatus(message: string, status: number): Error {
+  const error = new Error(message) as Error & { status: number };
+  error.status = status;
+  return error;
+}
+
+/**
+ * Reads a numeric HTTP status off a provider error. @google/genai throws ApiError with a numeric
+ * `status`, so that is the normal path; the remaining shapes (and the two narrow message patterns)
+ * are fallbacks for transport/wrapper errors that carry the code somewhere else. Deliberately does
+ * NOT scan for any loose 3-digit number — a status must be unambiguous or absent.
+ */
+export function extractErrorStatus(error: unknown): number | undefined {
+  const candidate = error as Record<string, any> | null | undefined;
+  const numeric = [
+    candidate?.status,
+    candidate?.statusCode,
+    candidate?.error?.code,
+    candidate?.error?.status,
+    candidate?.response?.status,
+  ];
+  for (const value of numeric) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  const message = String(candidate?.message ?? '');
+  const match = /"code"\s*:\s*(\d{3})/.exec(message) ?? /got status:\s*(\d{3})/i.exec(message);
+  return match ? Number(match[1]) : undefined;
+}
+
+/**
+ * Guarantees the error leaving a provider attempt exposes a numeric `status`, so withKeyFailover
+ * can tell a key fault (401/402/403/429 → try the next key) from a real failure (→ throw now).
+ * The original error object is returned whenever possible so callers keep its type and stack;
+ * only a non-writable error is wrapped, and then the cause is preserved.
+ */
+function ensureStatus(error: unknown): unknown {
+  if (typeof (error as { status?: unknown })?.status === 'number') return error;
+  const status = extractErrorStatus(error);
+  if (status === undefined) return error;
+  try {
+    (error as { status?: number }).status = status;
+    if (typeof (error as { status?: unknown }).status === 'number') return error;
+  } catch {
+    // frozen/sealed error object — fall through to the wrapper below
+  }
+  const wrapped = errorWithStatus(String((error as Error)?.message ?? 'Request failed'), status);
+  (wrapped as Error & { cause?: unknown }).cause = error;
+  return wrapped;
+}
+
+/**
+ * A Gemini client for one key. `ai` may be a prebuilt GoogleGenAI instance (legacy: the same
+ * instance serves every attempt, so multi-key failover cannot actually swap credentials) or a
+ * factory `(apiKey) => GoogleGenAI`, which is what real per-key failover requires.
+ */
+function resolveGeminiClient(ai: any, apiKey: string): any {
+  return typeof ai === 'function' ? ai(apiKey) : ai;
 }
 
 async function generateLyriaViaOpenRouter(
@@ -821,7 +925,9 @@ async function generateLyriaViaOpenRouter(
 
   if (!response.ok || !response.body) {
     const errText = await response.text().catch(() => response.statusText);
-    throw new Error(`OpenRouter Lyria request failed (${response.status}): ${errText}`);
+    // The HTTP status rides on the error so withKeyFailover can classify 401/402/403/429 as a
+    // key fault and move to the next key instead of failing the whole generation.
+    throw errorWithStatus(`OpenRouter Lyria request failed (${response.status}): ${errText}`, response.status);
   }
 
   const reader = response.body.getReader();
@@ -839,8 +945,24 @@ async function generateLyriaViaOpenRouter(
   return { audio: parsed.audio, lyricsOut };
 }
 
+/**
+ * Runs one real generation and persists it.
+ *
+ * Keys: each provider takes an ORDERED list (`geminiKeys` / `openRouterKeys`, falling back to the
+ * legacy single `geminiKey` / `openRouterKey`). The provider call runs inside withKeyFailover, so
+ * a key-level rejection (401/403 invalid, 402 no credit, 429 quota/entitlement wall — Google's
+ * free tier grants zero Lyria requests and reports exactly that) moves to the next key, while any
+ * other error throws immediately rather than re-billing the next account for the same bad request.
+ * Nothing is written to disk until an attempt is ACCEPTED: a rejected attempt leaves no audio
+ * file, no manifest, and not even the generations/ directory behind. An empty list maps to
+ * MissingKeyError (HTTP 400, unchanged message); every key being rejected throws AllKeysFailedError.
+ *
+ * `ai` is a prebuilt GoogleGenAI instance (legacy — one instance serves every attempt, so it
+ * cannot really swap credentials) or a factory `(apiKey) => GoogleGenAI`, which is what per-key
+ * Gemini failover needs. LYRIA_MOCK=1 uses no key and no client at all.
+ */
 export async function generateLyria(
-  ai: any, // GoogleGenAI instance from getAiClient
+  ai: any, // GoogleGenAI instance, or (apiKey) => GoogleGenAI factory, from getAiClient
   body: GenerateRequestBody,
   source?: GenerateLyriaSource,
 ): Promise<GenerateResult> {
@@ -862,13 +984,15 @@ export async function generateLyria(
       : MODEL_IDS[body.model ?? 'pro'];
   const format = body.model === 'clip' ? 'mp3' : (body.format ?? 'wav');
   const id = `gen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await fs.mkdir(GEN_DIR, { recursive: true });
 
   let audio: Buffer;
   let lyricsOut = '';
   let interactionId: string | undefined;
   let manifestProvider: 'gemini' | 'openrouter' | 'mock';
   let structure: unknown;
+  // Set only on the real provider paths, from the accepted attempt. Mock mode uses no key.
+  let keyUsedIndex: number | undefined;
+  let keyAttempts: KeyAttempt[] | undefined;
 
   if (process.env.LYRIA_MOCK === '1') {
     await new Promise(r => setTimeout(r, 1500)); // simulate latency
@@ -876,7 +1000,8 @@ export async function generateLyria(
     lyricsOut = body.lyrics?.trim() || '[Mock] instrumental';
     manifestProvider = 'mock';
   } else if (provider === 'openrouter') {
-    if (!source?.openRouterKey) {
+    const keys = effectiveKeyList(source?.openRouterKeys, source?.openRouterKey);
+    if (!keys.length) {
       throw new MissingKeyError('OPENROUTER_API_KEY is not configured. Please add it in the Settings.');
     }
     const finalPrompt = assembleLyriaPrompt({
@@ -887,9 +1012,13 @@ export async function generateLyria(
       model: body.model ?? 'pro',
     });
     const images = (body.images ?? []).slice(0, 10);
-    const result = await generateLyriaViaOpenRouter(source.openRouterKey, model, format, finalPrompt, images);
-    audio = result.audio;
-    lyricsOut = result.lyricsOut;
+    const outcome = await withKeyFailover(keys, key =>
+      generateLyriaViaOpenRouter(key, model, format, finalPrompt, images),
+    );
+    audio = outcome.value.audio;
+    lyricsOut = outcome.value.lyricsOut;
+    keyUsedIndex = outcome.usedIndex;
+    keyAttempts = outcome.attempts;
     manifestProvider = 'openrouter';
   } else {
     const finalPrompt = assembleLyriaPrompt({
@@ -905,8 +1034,30 @@ export async function generateLyria(
       : finalPrompt;
     const request: Record<string, unknown> = { model, input, store: false };
     if (format === 'wav') request.response_format = { type: 'audio' };
-    const interaction = await ai.interactions.create(request);
-    const parsed = parseInteraction(interaction);
+
+    const geminiKeys = effectiveKeyList(source?.geminiKeys, source?.geminiKey);
+    // Legacy callers pass a prebuilt client and no key material at all; that stays a single
+    // attempt against that client (the sentinel key is never read by resolveGeminiClient).
+    const legacyPrebuiltClient = !geminiKeys.length && ai != null && typeof ai !== 'function';
+    if (!geminiKeys.length && !legacyPrebuiltClient) {
+      throw new MissingKeyError('GEMINI_API_KEY is not configured. Please add it in the Settings.');
+    }
+    const attemptKeys = geminiKeys.length ? geminiKeys : [''];
+
+    const outcome = await withKeyFailover(attemptKeys, async key => {
+      try {
+        return await resolveGeminiClient(ai, key).interactions.create(request);
+      } catch (error) {
+        // Preserve/derive the numeric status so a key fault stays distinguishable from a real
+        // failure. Response PARSING stays outside this attempt: a malformed/audio-less response
+        // is not the key's fault and must never burn a second (paid) key.
+        throw ensureStatus(error);
+      }
+    });
+    keyUsedIndex = outcome.usedIndex;
+    keyAttempts = outcome.attempts;
+
+    const parsed = parseInteraction(outcome.value);
     audio = parsed.audio;
     lyricsOut = parsed.textBlocks.join('\n\n');
     interactionId = parsed.interactionId;
@@ -944,7 +1095,10 @@ export async function generateLyria(
   const durationTarget = normalizeSetting(body.durationTarget);
   const batchCount = normalizeBatchCount(body.batchCount);
 
+  // Everything below this line is the ACCEPTED attempt persisting itself. The directory is created
+  // here, not before the provider call, so a run where every key was rejected writes nothing at all.
   const audioFile = `${id}.${actualFormat}`;
+  await fs.mkdir(GEN_DIR, { recursive: true });
   await fs.writeFile(path.join(GEN_DIR, audioFile), embeddedAudio);
   const manifest: GenerationManifest = {
     id, model, format: actualFormat, interactionId,
@@ -967,6 +1121,8 @@ export async function generateLyria(
     ...(structure !== undefined ? { structure } : {}),
     ...(title !== undefined ? { title } : {}),
     ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+    // Reported together, and only for a real provider call: mock mode used no key at all.
+    ...(keyUsedIndex !== undefined ? { keyUsedIndex, keyAttempts: keyAttempts ?? [] } : {}),
   };
 }
 
@@ -1370,6 +1526,17 @@ export interface AnalyzeGenerationCallAiArgs {
   mimeType: string;
   format: 'wav' | 'mp3';
   prompt: string;
+  /**
+   * The key THIS attempt must use, supplied by the failover walk. Undefined only in the legacy
+   * mode where the caller passed no key material and resolves the key inside callAi itself.
+   */
+  apiKey?: string;
+}
+
+/** Which key of the ordered list was accepted, and which were rejected before it. */
+export interface KeyUsage {
+  keyUsedIndex: number;
+  keyAttempts: KeyAttempt[];
 }
 
 export interface AnalyzeGenerationOptions {
@@ -1378,6 +1545,22 @@ export interface AnalyzeGenerationOptions {
   dir?: string;
   /** Invokes the resolved provider (Gemini direct or OpenRouter) and returns its raw text response. */
   callAi: (args: AnalyzeGenerationCallAiArgs) => Promise<string>;
+  /** Which provider's key list applies. Defaults to 'gemini', matching generateLyria. */
+  provider?: 'gemini' | 'openrouter';
+  /** Ordered Gemini keys; used when provider is 'gemini'. */
+  geminiKeys?: string[];
+  /** Ordered OpenRouter keys; used when provider is 'openrouter'. */
+  openRouterKeys?: string[];
+  /** Legacy single Gemini key; used only when `geminiKeys` is not supplied. */
+  geminiKey?: string;
+  /** Legacy single OpenRouter key; used only when `openRouterKeys` is not supplied. */
+  openRouterKey?: string;
+  /**
+   * Reports the accepted key index and the rejected attempts. The return type stays `Analysis`
+   * (a cached analysis needs no provider call at all), so this callback is how those two numbers
+   * reach the route handler. Not invoked in legacy no-key mode, in mock mode, or on a cache hit.
+   */
+  onKeyUsage?: (usage: KeyUsage) => void;
 }
 
 const AUDIO_MIME_TYPES: Record<string, string> = {
@@ -1394,6 +1577,14 @@ const AUDIO_MIME_TYPES: Record<string, string> = {
  * base64-encodes the audio, invokes callAi (provider-specific request building lives in
  * server.ts), parses/validates the response with parseAnalysis, persists the result into the
  * manifest, and returns it. Throws AnalysisNotFoundError for an unknown id.
+ *
+ * Keys: when an ordered list (or a legacy single key) is supplied for the selected provider, the
+ * callAi invocation runs through withKeyFailover — each attempt receives its own `apiKey`, a key
+ * fault advances to the next key, anything else throws immediately, and every key being rejected
+ * throws AllKeysFailedError. An explicitly empty list maps to MissingKeyError. Callers that pass
+ * NO key fields at all keep the original behavior exactly: callAi is invoked once and resolves
+ * the key itself. Response parsing and the manifest write stay outside the failover, so a bad
+ * payload can never burn a second (paid) key and a rejected attempt persists nothing.
  */
 export async function analyzeGeneration(options: AnalyzeGenerationOptions): Promise<Analysis> {
   const { id, force, dir = GEN_DIR, callAi } = options;
@@ -1428,7 +1619,37 @@ export async function analyzeGeneration(options: AnalyzeGenerationOptions): Prom
   const audioBase64 = audioBuffer.toString('base64');
   const mimeType = AUDIO_MIME_TYPES[format];
 
-  const rawResponse = await callAi({ audioBase64, mimeType, format, prompt: ANALYSIS_PROMPT });
+  const callArgs = { audioBase64, mimeType, format, prompt: ANALYSIS_PROMPT };
+  const provider = options.provider === 'openrouter' ? 'openrouter' : 'gemini';
+  const keysSupplied =
+    options.geminiKeys !== undefined || options.openRouterKeys !== undefined ||
+    options.geminiKey !== undefined || options.openRouterKey !== undefined;
+
+  let rawResponse: string;
+  if (!keysSupplied) {
+    rawResponse = await callAi(callArgs); // legacy: callAi resolves its own key
+  } else {
+    const keys = provider === 'openrouter'
+      ? effectiveKeyList(options.openRouterKeys, options.openRouterKey)
+      : effectiveKeyList(options.geminiKeys, options.geminiKey);
+    if (!keys.length) {
+      throw new MissingKeyError(
+        provider === 'openrouter'
+          ? 'OPENROUTER_API_KEY is not configured. Please add it in the Settings.'
+          : 'GEMINI_API_KEY is not configured. Please add it in the Settings.',
+      );
+    }
+    const outcome = await withKeyFailover(keys, async apiKey => {
+      try {
+        return await callAi({ ...callArgs, apiKey });
+      } catch (error) {
+        throw ensureStatus(error);
+      }
+    });
+    rawResponse = outcome.value;
+    options.onKeyUsage?.({ keyUsedIndex: outcome.usedIndex, keyAttempts: outcome.attempts });
+  }
+
   const analysis = parseAnalysis(rawResponse);
 
   manifest.analysis = analysis;

@@ -43,8 +43,9 @@ This guide explains how to use every part of Lyria 3 Pro, from first launch to e
 1. Start the app (`npm run dev`, or `launch.bat` on Windows) and open **http://localhost:3001**.
 2. Click **SETTINGS** (gear, top right).
 3. Pick a provider: **GEMINI** or **OPENROUTER**. With no stored choice yet, the buttons follow the server's own default (`AI_PROVIDER`). Each one has an account requirement before generation will run — OpenRouter needs credits, Gemini needs billing enabled on the key. See [section 17](#17-settings-and-providers).
-4. Under each key field, a status line reports what is in use, for example `Browser: none · Server: configured`. If the server already has a key, you can close Settings. If not, paste your key and click **Save Settings** — until you do, the line warns that the change is unsaved.
-5. Click **DOCS** (book icon, top right) any time for the built-in 12-chapter reference.
+4. Each provider has an ordered **key list**. A status line above it reports counts only, for example `Browser: none · Server: 1 key`. If the server already has a key, you can close Settings. If not, paste your key into the field at the bottom of the list, press **Add**, then click **Save Settings** — until you do, the line warns `Unsaved changes — press Save Settings`.
+5. You can add more than one key per provider. They are tried top-down, and a key that gets rejected is skipped for the next one. See [section 17](#17-settings-and-providers).
+6. Click **DOCS** (book icon, top right) any time for the built-in 12-chapter reference.
 
 ![Settings](screenshots/settings.png)
 
@@ -335,8 +336,17 @@ The EXPORT panel (bottom of the right rail) shows which version it applies to an
 
 - **AI PROVIDER** (`GEMINI` or `OPENROUTER`) routes everything: generation, the wand, AUTO and analysis. Generation prices are identical on both. Until you save a choice, the selector follows the server's own default.
 - **What each provider requires.** Gemini generation needs a **billing-enabled** Google API key: Google's free tier grants zero Lyria requests per day, so a free-tier key fails immediately with `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)`. That is a quota wall, not a transient rate limit, so retrying never clears it. OpenRouter needs credits on the account and refuses audio requests under a $0.50 balance; it returns MP3 for both Pro and Clip. Mock mode needs neither and costs nothing.
-- **API keys** entered here are stored **in this browser only** and override the server's keys. Leave a field empty to use the server key from `.env.local`. The status line under each field reports only what is really saved, for example `Browser: none · Server: configured` or `Browser: saved — overrides server`, and warns `Unsaved change — press Save Settings` while an edit is still only typed. No part of a key is ever displayed back to you.
-- **OpenRouter balance.** With OpenRouter configured, Settings shows your live balance and how many songs or clips it covers, for example `Balance: $5.00 · ≈62 songs / 125 clips`. OpenRouter requires a balance of at least **$0.50** for any audio request and refuses below that before generating, so nothing is charged when it refuses. If your key is not allowed to read OpenRouter's credits endpoint, no balance line is shown — generation still works.
+- **API keys** entered here are stored **in this browser only**. Each provider has its own **ordered list**, so you can keep several keys and let the app work down them.
+  - **Add** a key by typing it into the field below the list (with an optional short label, for example `personal` or `work`) and pressing **Add** or Enter. Press **Save Settings** to store the list.
+  - **Reorder** with the up and down arrows on a row. **Position 1 is tried first.**
+  - **Remove** with the bin icon on a row.
+  - A key's value is **never shown back to you**, not even a fragment. A row shows its position number, its label (or `Key N` while unlabeled) and a status: `Saved`, `New`, `Moved` or `Renamed`.
+  - The status line above the list reports counts only, for example `Browser: 2 keys · Server: 1 key`, plus `Unsaved changes — press Save Settings` while an edit is only typed.
+  - Store no keys for a provider to use the server's keys from `.env.local` instead.
+- **How the fallback works.** Browser keys are tried before server keys, and within each group the keys are tried in the stored order. A key rejected for a reason that belongs to the key — invalid or revoked, out of credit, or a quota that grants zero requests (Google's free tier for Lyria is exactly that) — is skipped and the next key is tried. A **request-level** error such as a malformed request or a provider outage stops there and is not retried on another key, so nothing is billed twice.
+- **Server-side keys.** `.env.local` accepts a list in one variable, `GEMINI_API_KEY=key1,key2` (commas or newlines), or numbered variables `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, and so on. `OPENROUTER_API_KEY` works the same way. Numbered keys follow the list in the base variable.
+- **What you see afterwards.** When a request only succeeded after falling back, the cost line under GENERATE says so, for example `Used key 2 after key 1 was rejected`. If every key fails, the error names each rejected key **by position and reason** — `2 keys were rejected: key 1 (429 quota), key 2 (401 invalid)` — never by value.
+- **OpenRouter balance.** With OpenRouter configured, Settings shows the live balance of your **first** stored OpenRouter key and how many songs or clips it covers, for example `Balance: $5.00 · ≈62 songs / 125 clips`. OpenRouter requires a balance of at least **$0.50** for any audio request and refuses below that before generating, so nothing is charged when it refuses. If that key is not allowed to read OpenRouter's credits endpoint, no balance line is shown — generation still works.
 
 ## 18. Mock mode
 
@@ -386,9 +396,11 @@ These are limits of the Lyria 3 API itself. No interface can work around them.
 
 | Symptom | Fix |
 |---|---|
-| Settings shows `Server: not configured` and generation fails | Add a key to `.env.local` and restart the server, or paste a key into Settings and press Save Settings. |
-| Settings still shows the old key state after typing | The line says `Unsaved change — press Save Settings`. Nothing is stored until you do. |
-| Gemini generation fails with `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)` | The free tier grants zero Lyria requests per day, so this is a quota wall and not a transient rate limit — waiting or retrying will not clear it. Enable billing on the Google key, or switch the provider to OpenRouter. |
+| Settings shows `Server: none` and generation fails | Add a key to `.env.local` and restart the server, or add a key in Settings and press Save Settings. |
+| Settings still shows the old key state after typing | The line says `Unsaved changes — press Save Settings`. Nothing is stored until you do. A typed key is not in the list until you press **Add**. |
+| `All keys were rejected` | Every key in the list failed for a key-level reason. The message names each one by position and reason, for example `key 1 (429 quota), key 2 (401 invalid)`. Fix or replace those keys — top up an out-of-credit key, enable billing on a free-tier Google key, or remove a revoked one — then reorder the list so a working key is in position 1. |
+| A generation worked but the cost line says `Used key 2 after key 1 was rejected` | Key 1 was rejected and the app fell back. Nothing was billed for the rejected attempt. Fix key 1, or move the working key to position 1 so it is tried first. |
+| Gemini generation fails with `429 Rate limit exceeded for model lyria-3-clip (limit: 0 requests per day on Free Tier)` | The free tier grants zero Lyria requests per day, so this is a quota wall and not a transient rate limit — waiting or retrying will not clear it. Enable billing on the Google key, add a billing-enabled key to the list, or switch the provider to OpenRouter. |
 | OpenRouter generation refused | Your balance is under the $0.50 floor OpenRouter requires for audio requests. Top up on OpenRouter. Nothing was charged — it refuses before generating. |
 | No balance line in Settings, but OpenRouter works | Your key cannot read OpenRouter's credits endpoint. Only the readout is affected. |
 | Generation cancelled with AUTO on | Prompt enhancement failed, so nothing was generated or charged. Retry, or turn AUTO off. |

@@ -6,17 +6,27 @@ import dotenv from "dotenv";
 import { generateLyria, listGenerations, LyriaValidationError, analyzeGeneration, AnalysisNotFoundError, renameGeneration, GenerationNotFoundError, InvalidIdError, MissingKeyError, mockModifyText, mockEnhancePrompt, mapOpenRouterCreditsResponse } from "./server/lyria";
 import type { AnalyzeGenerationCallAiArgs } from "./server/lyria";
 import { listProjects, createProject, updateProject, archiveProject, ProjectNotFoundError } from "./server/projects";
+import { resolveKeys, numberedEnvValues, withKeyFailover, AllKeysFailedError } from "./server/keys";
+import type { KeyAttempt } from "./server/keys";
 
 // .env.local (documented setup) wins over .env; real environment variables win over both.
 dotenv.config({ path: ['.env.local', '.env'], quiet: true });
 
-function getAiClient(clientKey?: string): GoogleGenAI {
-  const key = clientKey || process.env.GEMINI_API_KEY;
-  if (!key || key === "MY_GEMINI_API_KEY" || key === "") {
-    throw new MissingKeyError("GEMINI_API_KEY is not configured. Please add it in the Settings.");
+type ProviderName = 'gemini' | 'openrouter';
+
+/** Message kept identical to the pre-failover one so the Settings UI copy still matches. */
+const MISSING_KEY_MESSAGE: Record<ProviderName, string> = {
+  gemini: "GEMINI_API_KEY is not configured. Please add it in the Settings.",
+  openrouter: "OPENROUTER_API_KEY is not configured. Please add it in the Settings.",
+};
+
+/** Builds a client for one specific key — key selection/failover happens in the routes. */
+function getAiClient(apiKey: string): GoogleGenAI {
+  if (!apiKey) {
+    throw new MissingKeyError(MISSING_KEY_MESSAGE.gemini);
   }
   return new GoogleGenAI({
-    apiKey: key,
+    apiKey,
     httpOptions: {
       headers: {
         'User-Agent': 'lyria-3-pro',
@@ -25,15 +35,166 @@ function getAiClient(clientKey?: string): GoogleGenAI {
   });
 }
 
-function resolveProvider(req: express.Request): 'gemini' | 'openrouter' {
+function resolveProvider(req: express.Request): ProviderName {
   const headerProvider = req.headers['x-ai-provider'] as string | undefined;
   const provider = headerProvider || process.env.AI_PROVIDER || 'gemini';
   return provider === 'openrouter' ? 'openrouter' : 'gemini';
 }
 
-function getOpenRouterKey(req: express.Request): string | undefined {
-  const clientKey = req.headers['x-openrouter-api-key'] as string | undefined;
-  return clientKey || process.env.OPENROUTER_API_KEY;
+/** A repeated header arrives as an array; join it so it parses as one comma-separated list. */
+function headerValue(req: express.Request, name: string): string | undefined {
+  const raw = req.headers[name];
+  return Array.isArray(raw) ? raw.join(',') : raw;
+}
+
+/**
+ * Ordered Gemini keys for this request: browser list header, then the legacy single
+ * header, then GEMINI_API_KEY (which may itself be a list), then GEMINI_API_KEY_2, _3...
+ * parseKeyList inside resolveKeys drops blanks, duplicates and the MY_GEMINI_API_KEY
+ * placeholder shipped in .env.example.
+ */
+function resolveGeminiKeys(req: express.Request): string[] {
+  return resolveKeys({
+    listHeader: headerValue(req, 'x-gemini-api-keys'),
+    singleHeader: headerValue(req, 'x-gemini-api-key'),
+    env: process.env.GEMINI_API_KEY,
+    numberedEnv: numberedEnvValues(process.env, 'GEMINI_API_KEY'),
+  });
+}
+
+/** Ordered OpenRouter keys for this request; same precedence as resolveGeminiKeys. */
+function resolveOpenRouterKeys(req: express.Request): string[] {
+  return resolveKeys({
+    listHeader: headerValue(req, 'x-openrouter-api-keys'),
+    singleHeader: headerValue(req, 'x-openrouter-api-key'),
+    env: process.env.OPENROUTER_API_KEY,
+    numberedEnv: numberedEnvValues(process.env, 'OPENROUTER_API_KEY'),
+  });
+}
+
+/** Keys the SERVER itself holds (no request headers) — used by /api/settings/status counts. */
+function resolveServerKeys(prefix: 'GEMINI_API_KEY' | 'OPENROUTER_API_KEY'): string[] {
+  return resolveKeys({
+    env: process.env[prefix],
+    numberedEnv: numberedEnvValues(process.env, prefix),
+  });
+}
+
+function resolveProviderKeys(req: express.Request, provider: ProviderName): string[] {
+  return provider === 'openrouter' ? resolveOpenRouterKeys(req) : resolveGeminiKeys(req);
+}
+
+/** Same as resolveProviderKeys but turns "nothing configured at all" into the 400 the UI expects. */
+function requireProviderKeys(req: express.Request, provider: ProviderName): string[] {
+  const keys = resolveProviderKeys(req, provider);
+  if (!keys.length) {
+    throw new MissingKeyError(MISSING_KEY_MESSAGE[provider]);
+  }
+  return keys;
+}
+
+/**
+ * Carries the upstream HTTP status on the Error so isKeyFault() in server/keys.ts can tell a
+ * key problem (401/402/403/429 → try the next key) from a request problem (fail immediately).
+ * Without this, an upstream body like `{"error":{"message":"User not found.","code":401}}`
+ * would never be recognised as a key fault.
+ */
+class ProviderHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+/**
+ * Defence in depth: upstream error bodies are outside our control, so any configured key that
+ * one of them echoed back is stripped before the text reaches a log, a header or a response.
+ */
+function redactKeys(text: string, keys: string[]): string {
+  let out = text;
+  for (const key of keys) {
+    if (key.length < 8) continue; // too short to be a real key; avoid mangling unrelated text
+    out = out.split(key).join('[redacted]');
+  }
+  return out;
+}
+
+/** Key-free, single-line, ASCII-only JSON for the x-lyria-key-attempts header. */
+function attemptsHeaderValue(attempts: KeyAttempt[], keys: string[]): string {
+  const compact = attempts.map(a => ({
+    index: a.index,
+    status: a.status,
+    reason: redactKeys(a.reason, keys).replace(/[^\x20-\x7e]/g, ' ').slice(0, 160),
+  }));
+  // Headers must stay small, and truncating a JSON string would produce invalid JSON —
+  // so drop detail in steps instead, keeping the value parseable at every step.
+  let json = JSON.stringify(compact);
+  if (json.length > 1000) json = JSON.stringify(compact.map(a => ({ ...a, reason: a.reason.slice(0, 40) })));
+  if (json.length > 1000) json = JSON.stringify(compact.map(a => ({ index: a.index, status: a.status })));
+  return json;
+}
+
+/** Reports which key was accepted, and which were rejected first, on a successful response. */
+function setKeyHeaders(res: express.Response, usedIndex: number, attempts: KeyAttempt[], keys: string[]): void {
+  if (res.headersSent) return;
+  res.setHeader('x-lyria-key-index', String(usedIndex));
+  if (attempts.length) {
+    res.setHeader('x-lyria-key-attempts', attemptsHeaderValue(attempts, keys));
+  }
+}
+
+/** Maps the final rejection onto an HTTP status: auth → 401, credit → 402, quota → 429, else 502. */
+function keyFailureStatus(attempts: KeyAttempt[]): number {
+  const statuses = attempts.map(a => a.status).filter((s): s is number => typeof s === 'number');
+  const last = statuses.length ? statuses[statuses.length - 1] : undefined;
+  if (last === 401 || last === 403) return 401;
+  if (last === 402) return 402;
+  if (last === 429) return 429;
+  return 502;
+}
+
+/**
+ * Terminal response for "every configured key was rejected". `error` stays the flat string the
+ * client already reads; `attempts` lists each rejected key by index only — describeFailure()
+ * never includes key material, and redactKeys() is a second guard over the upstream text.
+ */
+function sendKeyFailure(res: express.Response, error: AllKeysFailedError, keys: string[]) {
+  const attempts = error.attempts.map(a => ({
+    index: a.index,
+    status: a.status,
+    reason: redactKeys(a.reason, keys),
+  }));
+  return res.status(keyFailureStatus(error.attempts)).json({
+    error: redactKeys(error.message, keys),
+    attempts,
+  });
+}
+
+/** Non-streaming Gemini text completion for one specific key. */
+async function geminiText(apiKey: string, prompt: string): Promise<string> {
+  const ai = getAiClient(apiKey);
+  const response = await ai.models.generateContent({
+    model: "gemini-3.5-flash",
+    contents: prompt,
+  });
+  return response.text || "";
+}
+
+/** Gemini text completion with an inline audio part, for one specific key. */
+async function geminiAudioAnalyze(
+  apiKey: string,
+  prompt: string,
+  audioBase64: string,
+  mimeType: string,
+): Promise<string> {
+  const ai = getAiClient(apiKey);
+  const response = await ai.models.generateContent({
+    model: "gemini-3.5-flash",
+    contents: [
+      { inlineData: { data: audioBase64, mimeType } },
+      prompt,
+    ],
+  });
+  return response.text || "";
 }
 
 /** Non-streaming OpenRouter chat completion; returns the raw text/lyrics/prompt content. */
@@ -54,7 +215,7 @@ async function openRouterText(apiKey: string, prompt: string): Promise<string> {
 
   if (!response.ok) {
     const errText = await response.text().catch(() => response.statusText);
-    throw new Error(`OpenRouter request failed (${response.status}): ${errText}`);
+    throw new ProviderHttpError(`OpenRouter request failed (${response.status}): ${errText}`, response.status);
   }
 
   const data = await response.json();
@@ -90,7 +251,7 @@ async function openRouterAudioAnalyze(
 
   if (!response.ok) {
     const errText = await response.text().catch(() => response.statusText);
-    throw new Error(`OpenRouter request failed (${response.status}): ${errText}`);
+    throw new ProviderHttpError(`OpenRouter request failed (${response.status}): ${errText}`, response.status);
   }
 
   const data = await response.json();
@@ -106,10 +267,10 @@ async function startServer() {
 
   // API Endpoint to modify prompt or lyrics
   app.post("/api/ai/modify", async (req, res) => {
+    const provider = resolveProvider(req);
+    let keys: string[] = [];
     try {
       const { type, instruction, currentText, selectedText } = req.body;
-      const clientKey = req.headers['x-gemini-api-key'] as string;
-      const provider = resolveProvider(req);
 
       if (!instruction) {
         return res.status(400).json({ error: "Instruction is required" });
@@ -149,21 +310,13 @@ If no specific part was highlighted, please output the full updated music prompt
 CRITICAL: Output ONLY the requested raw replacement text or prompt. Do not include any explanations, markdown code blocks (such as \`\`\`), introduction, quotes, or outer formatting. Your output will be directly pasted into the editor.`;
       }
 
-      let modifiedText: string;
-      if (provider === 'openrouter') {
-        const openRouterKey = getOpenRouterKey(req);
-        if (!openRouterKey) {
-          throw new MissingKeyError("OPENROUTER_API_KEY is not configured. Please add it in the Settings.");
-        }
-        modifiedText = await openRouterText(openRouterKey, promptText);
-      } else {
-        const ai = getAiClient(clientKey);
-        const response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: promptText,
-        });
-        modifiedText = response.text || "";
-      }
+      // Walk the ordered key list: a key rejected for a key-level reason (revoked, no
+      // credit, quota/entitlement wall) falls through to the next one.
+      keys = requireProviderKeys(req, provider);
+      const { value: modifiedText, usedIndex, attempts } = await withKeyFailover(keys, key =>
+        provider === 'openrouter' ? openRouterText(key, promptText) : geminiText(key, promptText),
+      );
+      setKeyHeaders(res, usedIndex, attempts, keys);
 
       // Strip out code block markdown if the model wrapped it
       let cleanedText = modifiedText.trim();
@@ -183,17 +336,21 @@ CRITICAL: Output ONLY the requested raw replacement text or prompt. Do not inclu
       if (error instanceof MissingKeyError) {
         return res.status(400).json({ error: error.message });
       }
-      console.error("AI Modify error:", error);
-      res.status(500).json({ error: error.message || "An error occurred during modification" });
+      if (error instanceof AllKeysFailedError) {
+        console.error("AI Modify error: all configured keys were rejected");
+        return sendKeyFailure(res, error, keys);
+      }
+      console.error("AI Modify error:", redactKeys(String(error?.message ?? error), keys));
+      res.status(500).json({ error: redactKeys(error.message || "An error occurred during modification", keys) });
     }
   });
 
   // API Endpoint to automatically enhance a music prompt
   app.post("/api/ai/enhance-prompt", async (req, res) => {
+    const provider = resolveProvider(req);
+    let keys: string[] = [];
     try {
       const { prompt } = req.body;
-      const clientKey = req.headers['x-gemini-api-key'] as string;
-      const provider = resolveProvider(req);
 
       if (!prompt || !prompt.trim()) {
         return res.status(400).json({ error: "Prompt is required" });
@@ -213,29 +370,23 @@ Keep the enhanced prompt within 2-3 sentences. Do not make it overly long.
 
 CRITICAL: Output ONLY the enhanced prompt. Do not include any conversational filler, quotes, explanations, markdown formatting (like \`\`\`), or extra text. Output the raw text directly.`;
 
-      let enhancedText: string;
-      if (provider === 'openrouter') {
-        const openRouterKey = getOpenRouterKey(req);
-        if (!openRouterKey) {
-          throw new MissingKeyError("OPENROUTER_API_KEY is not configured. Please add it in the Settings.");
-        }
-        enhancedText = (await openRouterText(openRouterKey, promptText)).trim();
-      } else {
-        const ai = getAiClient(clientKey);
-        const response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: promptText,
-        });
-        enhancedText = (response.text || "").trim();
-      }
+      keys = requireProviderKeys(req, provider);
+      const { value: enhancedText, usedIndex, attempts } = await withKeyFailover(keys, key =>
+        provider === 'openrouter' ? openRouterText(key, promptText) : geminiText(key, promptText),
+      );
+      setKeyHeaders(res, usedIndex, attempts, keys);
 
-      res.json({ result: enhancedText });
+      res.json({ result: enhancedText.trim() });
     } catch (error: any) {
       if (error instanceof MissingKeyError) {
         return res.status(400).json({ error: error.message });
       }
-      console.error("AI Enhance error:", error);
-      res.status(500).json({ error: error.message || "An error occurred during enhancement" });
+      if (error instanceof AllKeysFailedError) {
+        console.error("AI Enhance error: all configured keys were rejected");
+        return sendKeyFailure(res, error, keys);
+      }
+      console.error("AI Enhance error:", redactKeys(String(error?.message ?? error), keys));
+      res.status(500).json({ error: redactKeys(error.message || "An error occurred during enhancement", keys) });
     }
   });
 
@@ -243,36 +394,40 @@ CRITICAL: Output ONLY the enhanced prompt. Do not include any conversational fil
   // LYRIA_MOCK=1 short-circuits inside analyzeGeneration (right before callAi would run):
   // deterministic mock analysis, no key needed, no paid call, nothing persisted.
   app.post("/api/ai/analyze", async (req, res) => {
+    const provider = resolveProvider(req);
+    // Resolved but NOT required up front: LYRIA_MOCK=1 short-circuits inside
+    // analyzeGeneration without ever invoking callAi, so mock mode still needs no key.
+    const keys = resolveProviderKeys(req, provider);
     try {
       const { id, force } = req.body;
-      const clientKey = req.headers['x-gemini-api-key'] as string;
-      const provider = resolveProvider(req);
 
       if (!id || typeof id !== 'string') {
         return res.status(400).json({ error: "id is required" });
       }
 
-      const callAi = async ({ audioBase64, mimeType, format, prompt }: AnalyzeGenerationCallAiArgs): Promise<string> => {
-        if (provider === 'openrouter') {
-          const openRouterKey = getOpenRouterKey(req);
-          if (!openRouterKey) {
-            throw new MissingKeyError("OPENROUTER_API_KEY is not configured. Please add it in the Settings.");
-          }
-          return openRouterAudioAnalyze(openRouterKey, prompt, audioBase64, format);
+      // analyzeGeneration owns the failover walk and hands each attempt the key to use; this
+      // closure only builds the provider-specific request for that one key.
+      const callAi = async ({ audioBase64, mimeType, format, prompt, apiKey }: AnalyzeGenerationCallAiArgs): Promise<string> => {
+        const key = apiKey ?? keys[0];
+        if (!key) {
+          throw new MissingKeyError(MISSING_KEY_MESSAGE[provider]);
         }
-
-        const ai = getAiClient(clientKey);
-        const response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: [
-            { inlineData: { data: audioBase64, mimeType } },
-            prompt,
-          ],
-        });
-        return response.text || "";
+        return provider === 'openrouter'
+          ? openRouterAudioAnalyze(key, prompt, audioBase64, format)
+          : geminiAudioAnalyze(key, prompt, audioBase64, mimeType);
       };
 
-      const analysis = await analyzeGeneration({ id, force: Boolean(force), callAi });
+      const analysis = await analyzeGeneration({
+        id,
+        force: Boolean(force),
+        callAi,
+        provider,
+        geminiKeys: provider === 'openrouter' ? undefined : keys,
+        openRouterKeys: provider === 'openrouter' ? keys : undefined,
+        // A cached analysis needs no provider call, so the accepted-key report arrives here
+        // rather than on the return value.
+        onKeyUsage: ({ keyUsedIndex, keyAttempts }) => setKeyHeaders(res, keyUsedIndex, keyAttempts, keys),
+      });
       res.json({ analysis });
     } catch (error: any) {
       if (error instanceof InvalidIdError || error instanceof MissingKeyError) {
@@ -281,31 +436,50 @@ CRITICAL: Output ONLY the enhanced prompt. Do not include any conversational fil
       if (error instanceof AnalysisNotFoundError) {
         return res.status(404).json({ error: error.message });
       }
-      console.error("AI Analyze error:", error);
-      res.status(500).json({ error: error.message || "An error occurred during analysis" });
+      if (error instanceof AllKeysFailedError) {
+        console.error("AI Analyze error: all configured keys were rejected");
+        return sendKeyFailure(res, error, keys);
+      }
+      console.error("AI Analyze error:", redactKeys(String(error?.message ?? error), keys));
+      res.status(500).json({ error: redactKeys(error.message || "An error occurred during analysis", keys) });
     }
   });
 
   // Real Lyria generation (LYRIA_MOCK=1 → local mock WAV, no API cost)
   app.post("/api/lyria/generate", async (req, res) => {
+    const provider = resolveProvider(req);
+    const geminiKeys = resolveGeminiKeys(req);
+    const openRouterKeys = resolveOpenRouterKeys(req);
+    const keys = provider === 'openrouter' ? openRouterKeys : geminiKeys;
     try {
-      const clientKey = req.headers['x-gemini-api-key'] as string;
-      const provider = resolveProvider(req);
-      const openRouterKey = getOpenRouterKey(req);
+      // A FACTORY, not a prebuilt client: per-key Gemini failover has to be able to build a
+      // client per attempt. Mock mode needs no client at all.
+      const aiFactory = process.env.LYRIA_MOCK !== '1' && provider !== 'openrouter' ? getAiClient : null;
 
-      let ai: any = null;
-      if (process.env.LYRIA_MOCK !== '1' && provider !== 'openrouter') {
-        ai = getAiClient(clientKey);
+      // Ordered lists per the server/lyria.ts contract (that layer owns the failover for its own
+      // provider calls); the single-key fields stay set to the first key for compatibility.
+      const result = await generateLyria(aiFactory, req.body, {
+        provider,
+        geminiKey: geminiKeys[0],
+        openRouterKey: openRouterKeys[0],
+        geminiKeys,
+        openRouterKeys,
+      });
+
+      if (result.keyUsedIndex !== undefined) {
+        setKeyHeaders(res, result.keyUsedIndex, result.keyAttempts ?? [], keys);
       }
-
-      const result = await generateLyria(ai, req.body, { provider, openRouterKey });
       res.json(result);
     } catch (error: any) {
       if (error instanceof LyriaValidationError || error instanceof MissingKeyError) {
         return res.status(400).json({ error: error.message });
       }
-      console.error("Lyria generate error:", error);
-      res.status(500).json({ error: error.message || "Generation failed" });
+      if (error instanceof AllKeysFailedError) {
+        console.error("Lyria generate error: all configured keys were rejected");
+        return sendKeyFailure(res, error, keys);
+      }
+      console.error("Lyria generate error:", redactKeys(String(error?.message ?? error), keys));
+      res.status(500).json({ error: redactKeys(error.message || "Generation failed", keys) });
     }
   });
 
@@ -403,7 +577,9 @@ CRITICAL: Output ONLY the enhanced prompt. Do not include any conversational fil
   // silently shows no balance instead of erroring on a perfectly valid inference key.
   app.get("/api/openrouter/credits", async (req, res) => {
     try {
-      const openRouterKey = getOpenRouterKey(req);
+      // Balance is per account, so only the first key in the resolved order is meaningful
+      // (the browser's, when it sent any) — no failover here, and nothing is spent either way.
+      const openRouterKey = resolveOpenRouterKeys(req)[0];
       if (!openRouterKey) {
         return res.status(404).json({ error: "No OpenRouter key configured" });
       }
@@ -424,12 +600,17 @@ CRITICAL: Output ONLY the enhanced prompt. Do not include any conversational fil
     }
   });
 
-  // Key/provider status for the Settings modal — booleans only, never key material
+  // Key/provider status for the Settings modal — counts and booleans only, never key material.
+  // The counts cover every server-side source (the list-valued GEMINI_API_KEY / OPENROUTER_API_KEY
+  // plus the numbered _2, _3... variants); the booleans are kept for older clients.
   app.get("/api/settings/status", (_req, res) => {
-    const geminiKey = process.env.GEMINI_API_KEY;
+    const geminiServerKeys = resolveServerKeys('GEMINI_API_KEY').length;
+    const openRouterServerKeys = resolveServerKeys('OPENROUTER_API_KEY').length;
     res.json({
-      geminiServerKey: Boolean(geminiKey && geminiKey !== "MY_GEMINI_API_KEY"),
-      openRouterServerKey: Boolean(process.env.OPENROUTER_API_KEY),
+      geminiServerKey: geminiServerKeys > 0,
+      openRouterServerKey: openRouterServerKeys > 0,
+      geminiServerKeys,
+      openRouterServerKeys,
       defaultProvider: process.env.AI_PROVIDER === 'openrouter' ? 'openrouter' : 'gemini',
     });
   });
